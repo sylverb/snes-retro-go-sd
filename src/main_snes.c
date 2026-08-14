@@ -35,6 +35,7 @@
 #include "crc32.h"
 
 #include "gw_core_bridge.h"
+#include "gw_core_i18n.h"
 
 void draw_error_screen(const char *main_line, const char *line_1, const char *line_2);
 
@@ -80,16 +81,19 @@ static void snes_wait_button(void)
 
 bool snes_loadRom(Snes *snes, const uint8_t *data, int length);   /* snes_other.c */
 
-#define SNES_FPS            60
+#define SNES_FPS_NTSC       60
+#define SNES_FPS_PAL        50
 #define SNES_WIDTH          256
 #define SNES_HEIGHT         224
 #define SNES_AUDIO_RATE     16000
-#define SNES_AUDIO_SAMPLES  (SNES_AUDIO_RATE / SNES_FPS)   /* 266/frame */
+#define SNES_AUDIO_SAMPLES_NTSC  (SNES_AUDIO_RATE / SNES_FPS_NTSC) /* 266 */
+#define SNES_AUDIO_SAMPLES_PAL   (SNES_AUDIO_RATE / SNES_FPS_PAL)  /* 320 */
+#define SNES_AUDIO_SAMPLES_MAX   SNES_AUDIO_SAMPLES_PAL
 
 /* Savestate stamp: a raw struct dump must refuse files this build didn't
  * write (project rule — a stale state "loads" and restores nonsense). */
 #define SNES_STATE_MAGIC    0x31534E53u   /* "SNS1" */
-#define SNES_STATE_VERSION  2   /* v2: + controller shift registers (see below) */
+#define SNES_STATE_VERSION  3   /* v3: PAL DSP sampleBuffer 640 */
 
 /* ---- hooks the snes lib links against ------------------------------------
  * Super Metroid RTL hooks; a generic core has no reimplementation so they
@@ -137,7 +141,9 @@ static Snes *snes;
 /* 128 KB WRAM lives in the overlay BSS (like the SM port's g_ram): the AHB
  * pool is only 120 KB total and the Apu (~66 KB) already comes from it. */
 static uint8_t snes_wram[0x20000];
-static int16_t audio_buf[SNES_AUDIO_SAMPLES];  /* mono frame mix from the DSP  */
+static int16_t audio_buf[SNES_AUDIO_SAMPLES_MAX];
+static int snes_fps = SNES_FPS_NTSC;
+static int snes_audio_samples = SNES_AUDIO_SAMPLES_NTSC;
 
 /* ---- event loop (verbatim from tools/snes_harness/snes_main.c) ------------ */
 #ifdef SNES_BUS_IN_ITCM
@@ -455,16 +461,111 @@ static void blit(void) {
   common_ingame_overlay();
 }
 
+/* Locked half-rate present: emulate every frame (CPU/APU/audio), composite
+ * and swap only every other one. Regular frameskip drops whichever frames
+ * the integrator is late on, so the cadence jitters; this is a steady 30 Hz
+ * (25 Hz PAL) picture. On by default — most titles cannot hold 60 Hz present
+ * and the locked 30 Hz cadence is smoother than adaptive skip. */
+static bool snes_half_render = true;
+static uint8_t snes_half_ctr;
+static char snes_half_value[2];
+
+static const gw_i18n_entry_t i18n_half_render[] = {
+  { "en", "Half-rate render" },
+  { "fr", "Rendu 1 image / 2" },
+  { "es", "Render 1 de cada 2" },
+  { "de", "Jedes 2. Bild" },
+  GW_I18N_END
+};
+
+/* Locked half-rate: present at snes_fps/2. The panel PLL only knows 50/60
+ * (lcd_set_refresh_rate(30) is a no-op), so vsync stays native. The pause
+ * bar's FPS is odroid_system_tick via common_emu_frame_loop — one count per
+ * call — so we only call it on present slots or the bar keeps saying 60. */
+static bool snes_half_lock_active(void)
+{
+  if (!snes_half_render)
+    return false;
+  rg_app_desc_t *app = odroid_system_get_app();
+  return !app || app->speedupEnabled == SPEEDUP_1x;
+}
+
+static void snes_apply_frame_time(void)
+{
+  int fps = snes_fps;
+  if (snes_half_lock_active() && fps > 1)
+    fps /= 2;
+  common_emu_state.frame_time_10us = (uint16_t)(100000 / fps + 0.5f);
+}
+
+static bool snes_half_render_cb(odroid_dialog_choice_t *option,
+                               odroid_dialog_event_t event, uint32_t repeat)
+{
+  (void)repeat;
+  if (event == ODROID_DIALOG_PREV || event == ODROID_DIALOG_NEXT) {
+    snes_half_render = !snes_half_render;
+    odroid_settings_app_int32_set("HalfRender", snes_half_render ? 1 : 0);
+    snes_apply_frame_time();
+  }
+  strcpy(option->value, snes_half_render ? "\x06" : "\x05");
+  return event == ODROID_DIALOG_ENTER;
+}
+
 /* ---- audio ----------------------------------------------------------------
  * Top the DSP up to one frame of samples (534 stereo pairs internally) and
- * downmix to 16 kHz mono, exactly like the harness/rig. */
-static void snes_pcm_emit(void);
+ * downmix to 16 kHz mono, exactly like the harness/rig.
+ *
+ * DMA is filled by the firmware SAI ISR via pcm_attach(), not from this
+ * loop. At ~30 Hz (half-rate present, or a slow title) a main-loop emit
+ * always lands on the same dma_state selector, so one half-buffer is
+ * rewritten and the other plays stale/short contents — the "buffer never
+ * quite fills" sound. The ISR writes every completed half from this ring. */
+#define SNES_PCM_RING 2048u
+_Static_assert((SNES_PCM_RING & (SNES_PCM_RING - 1u)) == 0u,
+               "pcm ring must be a power of two");
+static int16_t snes_pcm_ring[SNES_PCM_RING];
+static volatile uint16_t snes_pcm_head;
+static volatile uint16_t snes_pcm_tail;
+
+static void snes_pcm_pump(void)
+{
+  const uint16_t mask = (uint16_t)(SNES_PCM_RING - 1u);
+  /* Keep ~3 DMA periods queued so a slow PPU frame (~2 periods) cannot
+   * drain the ring down to pcm_fill writing zeros for the rest of a half. */
+  uint16_t target = (uint16_t)(snes_audio_samples * 3);
+  if (target > (uint16_t)(SNES_PCM_RING / 2u))
+    target = (uint16_t)(SNES_PCM_RING / 2u);
+
+  uint16_t tail = snes_pcm_tail;
+  uint16_t head = snes_pcm_head;
+  uint16_t used = (uint16_t)((head - tail) & mask);
+  if (used >= target)
+    return;
+
+  uint16_t need = (uint16_t)(target - used);
+  uint16_t space = (uint16_t)((tail - head - 1u) & mask);
+  if (need > space)
+    need = space;
+
+  while (need) {
+    uint16_t n = need;
+    if (n > (uint16_t)SNES_AUDIO_SAMPLES_MAX)
+      n = (uint16_t)SNES_AUDIO_SAMPLES_MAX;
+    snes_stretch_pull(audio_buf, n);
+    for (uint16_t i = 0; i < n; i++) {
+      snes_pcm_ring[head] = audio_buf[i];
+      head = (uint16_t)((head + 1u) & mask);
+    }
+    need = (uint16_t)(need - n);
+  }
+  snes_pcm_head = head;
+}
 
 static void snes_pcm_submit(void) {
   if (snes->apu) {
 #ifdef SNES_SMW_HLE_PRODUCT
     if (g_wire_on) {
-      wire_frame_audio(audio_buf, SNES_AUDIO_SAMPLES);
+      wire_frame_audio(audio_buf, snes_audio_samples);
     } else
 #endif
     {
@@ -479,8 +580,11 @@ static void snes_pcm_submit(void) {
     {
       extern void wdog_refresh(void);
       int guard = 0;
-      while (snes->apu->dsp->sampleOffset < 534) {
-        int need = 534 - snes->apu->dsp->sampleOffset;
+      int dsp_need = snes->apu->dsp->frameSamples;
+      if (dsp_need <= 0 || dsp_need > DSP_SAMPLES_MAX)
+        dsp_need = DSP_SAMPLES_NTSC;
+      while (snes->apu->dsp->sampleOffset < dsp_need) {
+        int need = dsp_need - snes->apu->dsp->sampleOffset;
         int cycles = need * 32;
         if (cycles > 2048)
           cycles = 2048;
@@ -491,36 +595,26 @@ static void snes_pcm_submit(void) {
           break; /* never spin forever if sampleOffset stalls */
       }
     }
-    dsp_getSamples(snes->apu->dsp, audio_buf, SNES_AUDIO_SAMPLES, 1);
+    dsp_getSamples(snes->apu->dsp, audio_buf, snes_audio_samples, 1);
     SNES_PROF_APU_SCOPE_EXIT(apu_t0);
     }
   } else {
     memset(audio_buf, 0, sizeof(audio_buf));
   }
 
-  /* Hand the frame's emulated samples to the stretcher instead of straight to
-   * the DMA. Below 60 emulated fps the DMA eats more buffers than the core
-   * fills, and the old code's answer was to write 266 samples and zero the
-   * rest of the buffer -- an audible gap every slow frame. See
-   * snes_audio_stretch.h; the emulated machine is not touched, only the rate
-   * the already-produced samples are played back at. */
-  snes_stretch_push(audio_buf, SNES_AUDIO_SAMPLES);
-  snes_pcm_emit();
-}
-
-/* Fill ONE audio-DMA buffer from the stretcher. Called once per DMA period,
- * not once per emulated frame -- that distinction is the fix: the pacing
- * block below calls it again for every period a slow frame ran past, so no
- * period is left playing whatever the previous one left behind. */
-static void snes_pcm_emit(void) {
-  if (common_emu_sound_loop_is_muted())
+  /* Mute via pcm_silent so the ISR writes zeros and does not drain the
+   * ring. Skip push+pump or a long pause fills the stretcher. */
+  int vol = (int)common_emu_sound_get_volume();
+  int play = !common_emu_sound_loop_is_muted();
+  pcm_audio_set(vol, play);
+  if (!play)
     return;
-  int16_t *dst = audio_get_active_buffer();
-  uint16_t dst_len = audio_get_buffer_length();
-  snes_stretch_pull(dst, dst_len);
-  int32_t factor = common_emu_sound_get_volume();
-  for (uint16_t i = 0; i < dst_len; i++)
-    dst[i] = (int16_t)(((int32_t)dst[i] * factor) >> 8);
+
+  /* Hand the frame's emulated samples to the stretcher, then top the ISR
+   * ring up. The stretcher always writes a full pull; pcm_fill only zeros
+   * when the ring is empty. */
+  snes_stretch_push(audio_buf, snes_audio_samples);
+  snes_pcm_pump();
 }
 
 /* ---- savestate -------------------------------------------------------------
@@ -638,6 +732,7 @@ static bool snes_LoadState(const char *pathName) {
 }
 
 static void *snes_Screenshot(void) {
+  // Todo : rerender frame in active buffer to remove HUD
   lcd_wait_for_vblank();
   return lcd_get_active_buffer();
 }
@@ -842,6 +937,7 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 
   odroid_gamepad_state_t joystick;
   odroid_dialog_choice_t options[] = {
+      {100, gw_i18n(i18n_half_render), snes_half_value, 1, &snes_half_render_cb},
       ODROID_DIALOG_CHOICE_LAST
   };
 
@@ -851,10 +947,12 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
   } else {
     common_emu_state.pause_after_frames = 0;
   }
-  common_emu_state.frame_time_10us = (uint16_t)(100000 / SNES_FPS + 0.5f);
-  lcd_set_refresh_rate(SNES_FPS);
+  common_emu_state.frame_time_10us = (uint16_t)(100000 / SNES_FPS_NTSC + 0.5f);
+  lcd_set_refresh_rate(SNES_FPS_NTSC);
 
   odroid_system_init(APPID_SNES, SNES_AUDIO_RATE);
+  snes_half_render = odroid_settings_app_int32_get("HalfRender", 1) != 0;
+  snes_apply_frame_time();
 #ifdef SNES_SMW_HLE_PRODUCT
   odroid_system_emu_init(&snes_LoadState, &snes_SaveState, &snes_Screenshot,
                          &snes_wire_diag_flush, NULL, &snes_wire_diag_flush, NULL);
@@ -945,6 +1043,8 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
   printf("snes: spin_reset\n");
   spin_reset();   /* clean slate either way (spin-skip learner / rc dispatch) */
   snes_stretch_reset();   /* and the audio stretcher: a new ROM starts empty */
+  snes_pcm_head = 0;
+  snes_pcm_tail = 0;
 
   printf("snes: loadRom enter\n");
   wdog_refresh();
@@ -967,6 +1067,12 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     odroid_system_switch_app(0);
     return;
   }
+  snes_fps = snes->pal ? SNES_FPS_PAL : SNES_FPS_NTSC;
+  snes_audio_samples = SNES_AUDIO_RATE / snes_fps;
+  snes_apply_frame_time();
+  lcd_set_refresh_rate((uint32_t)snes_fps);
+  printf("snes: %s %dHz (%u lines)\n",
+         snes->pal ? "PAL" : "NTSC", snes_fps, (unsigned)snes->vcount);
   /* Defer SAI until the loop: starting DMA during/right after the 64 KB ARAM
    * wipe raced the bus on earlier bring-up builds. */
   printf("snes: ROM loaded, entering loop\n");
@@ -1092,7 +1198,7 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 #ifdef SNES_DEVICE_PROFILE
   /* Arm AFTER snes_init()/load_state so the AHB pre-flight sees the Apu's
    * 66 KB already taken, and after the last boot-time SD write. */
-  snes_profile_init(SNES_AUDIO_RATE, SNES_AUDIO_SAMPLES);
+  snes_profile_init(SNES_AUDIO_RATE, snes_audio_samples);
   uint32_t prof_wall_prev = snes_prof_wall_now();
   uint32_t prof_dma_prev  = dma_counter;
 #endif
@@ -1112,7 +1218,26 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 #endif
     wdog_refresh();
 
-    bool drawFrame = common_emu_frame_loop();
+    bool half_lock = snes_half_lock_active();
+    bool present_slot = true;
+    if (half_lock) {
+      present_slot = (snes_half_ctr & 1) == 0;
+      snes_half_ctr++;
+    }
+    snes_apply_frame_time();
+
+    bool drawFrame;
+    if (half_lock && !present_slot) {
+      /* Skip frame_loop so the HUD counts presented frames (~30/25), not
+       * emulated ones. CPU/APU still run below. */
+      drawFrame = false;
+    } else {
+      if (half_lock)
+        common_emu_state.skip_frames = 0;
+      drawFrame = common_emu_frame_loop();
+      if (half_lock)
+        drawFrame = true;
+    }
     SNES_PROF_MARK(SNES_PROF_M_FRAMECTL);
 
     odroid_input_read_gamepad(&joystick);
@@ -1141,11 +1266,15 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     SNES_PROF_MARK(SNES_PROF_M_PRESENT_KICK);
 
     if (!audio_started) {
-      audio_start_playing(SNES_AUDIO_SAMPLES);
+      /* start_playing clears pcm_owns — attach/enable must come after. */
+      audio_start_playing(snes_audio_samples);
+      pcm_attach(snes_pcm_ring, (int)SNES_PCM_RING, &snes_pcm_head, &snes_pcm_tail);
+      pcm_audio_set((int)common_emu_sound_get_volume(), 1);
       audio_started = 1;
       wdog_refresh();
     }
     snes_pcm_submit();
+    pcm_audio_enable(1);
     SNES_PROF_MARK(SNES_PROF_M_PCM);
 
     if (drawFrame) {
@@ -1175,17 +1304,7 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      * play audio at fast-forward speed (SMW 55fps = 92% speed, SM 31fps =
      * half speed). Waiting for one DMA tick every frame caps the emulator at
      * real time so the tempo is correct; on frames that genuinely overran,
-     * the DMA has already advanced so this passes through with no delay.
-     *
-     * Catch-up: if the DMA advanced multiple periods during a slow frame,
-     * produce extra audio batches so the next periods have fresh data. Stale
-     * audio from the underrun period itself is irrecoverable, but this
-     * prevents compounding — both half-buffers end up fresh. HLE (SMW)
-     * produces audio cheaply (no SPC700); LLE (Zelda/SM) pays ~0.5ms per
-     * extra batch (one DSP frame of apu_cycle). Port sync for LLE: extra
-     * apu_cycle calls advance SPC700 beyond the CPU frame; SPC700 reads
-     * stale $2140-43 ports — inaudible for music (N-SPC polls ports
-     * periodically, not per-sample). */
+     * the DMA has already advanced so this passes through with no delay. */
     /* Pace only once SAI is running — otherwise dma_counter never moves and
      * the 100k-iter guard just burns time (and can still trip WWDG under load). */
     if (odroid_system_get_app()->speedupEnabled == SPEEDUP_1x) {
@@ -1229,37 +1348,10 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
         }
         uint32_t elapsed = dma_counter - snes_last_dma;
         snes_last_dma = dma_counter;
-        /* LLE catch-up. A frame slower than one 16.625 ms audio period leaves
-         * the periods it ran past playing stale buffer contents -- the comment
-         * below used to call that an accepted underrun, and the device profile
-         * showed it on every single frame (deadline advance 1 on 34, 2 on 30,
-         * 0 on none). Fill those periods too. This does NOT call apu_cycle, so
-         * the SPC700 timer never moves relative to the 65816 and the tempo
-         * objection below does not apply: the samples come from the stretcher,
-         * which is resampling audio the core already produced.
-         * Backlog past a few periods is a pause/load, not a slow frame -- drop
-         * it and resync rather than grind, same rule (and the same watchdog-fed,
-         * bounded wait) the wire path settled on after the SMW-menu death. */
-        if (elapsed > 4) elapsed = 1;
-        while (elapsed > 1) {
-            snes_pcm_emit();
-            uint32_t guard = 0;
-            while (dma_counter == snes_last_dma && guard < 20000u) {
-                wdog_refresh();
-                cpumon_sleep();
-                guard++;
-            }
-            snes_last_dma = dma_counter;
-            elapsed--;
-        }
-        /* Catch-up only for HLE: wire_frame_audio produces samples without
-         * advancing the SPC700, so extra batches are free and tempo stays
-         * exact. For LLE, extra apu_cycle calls would drift the SPC700's
-         * internal timer relative to the CPU, changing music tempo (the
-         * port-sync-drift the user flagged). LLE accepts the underrun
-         * (stale audio for one DMA period on slow frames) rather than
-         * distorting tempo — the WS unconditional wait above already
-         * guarantees correct playback speed. */
+        /* LLE: the SAI ISR fills every DMA half from the pcm ring, so a
+         * slow frame no longer leaves one half playing stale samples.
+         * Catch-up only for HLE — wire_frame_audio does not advance the
+         * SPC700, extra batches stay tempo-correct. */
 #ifdef SNES_SMW_HLE_PRODUCT
         if (g_wire_on) {
             /* Catch-up: replay the audio batches the DMA advanced past on a slow

@@ -93,6 +93,7 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
     cart_attachDsp1(snes->cart);
   }
   snes_reset(snes, true); // reset after loading
+  snes_set_region(snes, headers[used].pal);
   return true;
 #else
   // expand to a power of 2
@@ -125,6 +126,7 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
     cart_attachDsp1(snes->cart);
   }
   snes_reset(snes, true); // reset after loading
+  snes_set_region(snes, headers[used].pal);
   free(newData);
   return true;
 #endif

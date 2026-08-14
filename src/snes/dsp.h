@@ -13,6 +13,11 @@ typedef struct Dsp Dsp;
 
 typedef struct Apu Apu;
 
+/* Native DSP output is 32040 Hz: 534 samples/frame NTSC, 640 PAL. */
+#define DSP_SAMPLES_NTSC 534
+#define DSP_SAMPLES_PAL  640
+#define DSP_SAMPLES_MAX  DSP_SAMPLES_PAL
+
 typedef struct DspChannel {
   // pitch
   uint16_t pitch;
@@ -76,9 +81,9 @@ struct Dsp {
   int8_t firValues[8];
   int16_t firBufferL[8];
   int16_t firBufferR[8];
-  // sample buffer (1 frame at 32040 Hz: 534 samples, *2 for stereo)
-  int16_t sampleBuffer[534 * 2];
-  uint16_t sampleOffset; // current offset in samplebuffer
+  int16_t sampleBuffer[DSP_SAMPLES_MAX * 2];
+  uint16_t sampleOffset;
+  uint16_t frameSamples; /* DSP_SAMPLES_NTSC or DSP_SAMPLES_PAL */
 };
 
 typedef struct DspRegWriteHistory {

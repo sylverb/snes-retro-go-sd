@@ -76,11 +76,16 @@ struct Snes {
    * savestate must never carry a host address across a load. */
   const uint8_t *romPageBase;
   uint32_t romPageTag;
+  /* PAL (header $ffd9): 312 lines / 50 Hz. After romPageTag so Thumb-2
+   * SNES_ROMPAGE* offsets stay valid. Not in the savestate range. */
+  bool pal;
+  uint16_t vcount; /* 262 NTSC, 312 PAL */
 };
 
 Snes* snes_init(uint8_t *ram);
 void snes_free(Snes* snes);
 void snes_reset(Snes* snes, bool hard);
+void snes_set_region(Snes* snes, bool pal);
 void snes_runFrame(Snes* snes);
 // used by dma, cpu
 uint8_t snes_readBBus(Snes* snes, uint8_t adr);

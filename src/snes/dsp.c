@@ -200,6 +200,7 @@ void dsp_reset(Dsp* dsp) {
   memset(dsp->firBufferR, 0, sizeof(dsp->firBufferR));
   memset(dsp->sampleBuffer, 0, sizeof(dsp->sampleBuffer));
   dsp->sampleOffset = 0;
+  dsp->frameSamples = DSP_SAMPLES_NTSC;
 }
 
 void dsp_saveload(Dsp *dsp, SaveLoadFunc *func, void *ctx) {
@@ -337,7 +338,7 @@ void dsp_cycle(Dsp* dsp) {
   }
   dsp_handleNoise(dsp);
   // put it in the samplebuffer
-  if (dsp->sampleOffset < 534) {
+  if (dsp->sampleOffset < dsp->frameSamples) {
 #ifdef SNES_DSP_MONO
     if (emitSample)
       dsp->sampleBuffer[dsp->sampleOffset >> 1] =
@@ -346,7 +347,7 @@ void dsp_cycle(Dsp* dsp) {
     dsp->sampleBuffer[dsp->sampleOffset * 2] = totalL;
     dsp->sampleBuffer[dsp->sampleOffset * 2 + 1] = totalR;
 #endif
-    // prevent sampleOffset from going above 534-1 (out of sampleBuffer bounds)
+    // prevent sampleOffset from going past the current frame (NTSC 534 / PAL 640)
     dsp->sampleOffset++;
   }
   dsp->evenCycle = !dsp->evenCycle;
@@ -895,9 +896,10 @@ void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val) {
 }
 
 void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame, int numChannels) {
+  const int src = dsp->frameSamples ? dsp->frameSamples : DSP_SAMPLES_NTSC;
 #ifdef SNES_DSP_MONO
   /* The device-rate mono samples were emitted directly by dsp_cycle(). */
-  const int available = 266;
+  const int available = src / 2;
   if (numChannels == 1) {
     for (int i = 0; i < samplesPerFrame; i++)
       sampleData[i] = dsp->sampleBuffer[i < available ? i : available - 1];
@@ -910,8 +912,8 @@ void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame, int numC
   }
   dsp->sampleOffset = 0;
 #else
-  // resample from 534 samples per frame to wanted value
-  double adder = 534.0 / samplesPerFrame;
+  // resample from native DSP samples/frame (534 NTSC / 640 PAL) to wanted value
+  double adder = (double)src / samplesPerFrame;
   double location = 0.0;
   if (numChannels == 1) {
     // The Game & Watch's SAI is mono. Downmix rather than writing two samples per
@@ -929,7 +931,7 @@ void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame, int numC
       location += adder;
       int end = (int)location;
       if (end <= start) end = start + 1;
-      if (end > 534) end = 534;
+      if (end > src) end = src;
 
       int32_t sum = 0;
       for (int s = start; s < end; s++)

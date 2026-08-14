@@ -47,6 +47,8 @@ Snes* snes_init(uint8_t *ram) {
    * garbage pointer. Set it here as well as in snes_reset(). */
   snes->romPageTag = ~(uint32_t)0;
   snes->romPageBase = NULL;
+  snes->pal = false;
+  snes->vcount = 262;
   snes->apuDotsAccum = 0;
   snes->cpu = cpu_init(snes, 0);
 #if defined(TARGET_GNW) && !defined(GNW_SNES_CORE)
@@ -153,6 +155,7 @@ void snes_reset(Snes* snes, bool hard) {
   snes->divideResult = 0x101;
   snes->fastMem = false;
   snes->openBus = 0;
+  snes_set_region(snes, snes->pal);
 }
 
 void snes_handle_pos_stuff(Snes *snes) {
@@ -226,7 +229,7 @@ void snes_handle_pos_stuff(Snes *snes) {
   if (snes->hPos == 1364) {
     snes->hPos = 0;
     snes->vPos++;
-    if (snes->vPos == 262) {
+    if (snes->vPos == snes->vcount) {
       snes->vPos = 0;
       snes->frames++;
 //      snes_catchupApu(snes); // catch up the apu at the end of the frame
@@ -290,7 +293,7 @@ void snes_run_line(Snes *snes) {
 
   /* end of line */
   snes->vPos++;
-  if (snes->vPos == 262) {
+  if (snes->vPos == snes->vcount) {
     snes->vPos = 0;
     snes->frames++;
   }
@@ -298,10 +301,16 @@ void snes_run_line(Snes *snes) {
 
 #define IS_ADR(x) (x == 0xfffff)
 
-/* (32040*32)/(1364*262*60) — APU clock / master clock ratio. Kept here (not in
- * main_snes.c) because snes_catchupApu is the single conversion point for the
- * integer dot accumulator. main_snes.c just does apuDotsAccum += step per dot. */
-#define APU_CYCLES_PER_MASTER ((32040.0 * 32.0) / (1364.0 * 262.0 * 60.0))
+/* NTSC: (32040*32)/(1364*262*60). PAL: same APU clock over 312 lines at 50 Hz. */
+#define APU_CYCLES_PER_MASTER_NTSC ((32040.0 * 32.0) / (1364.0 * 262.0 * 60.0))
+#define APU_CYCLES_PER_MASTER_PAL  ((32040.0 * 32.0) / (1364.0 * 312.0 * 50.0))
+
+void snes_set_region(Snes *snes, bool pal) {
+  snes->pal = pal;
+  snes->vcount = pal ? 312 : 262;
+  if (snes->apu && snes->apu->dsp)
+    snes->apu->dsp->frameSamples = pal ? DSP_SAMPLES_PAL : DSP_SAMPLES_NTSC;
+}
 
 void snes_catchupApu(Snes* snes) {
   if (snes->apu == NULL)
@@ -312,7 +321,8 @@ void snes_catchupApu(Snes* snes) {
    * core) still accumulates apuCatchupCycles directly — its apuDotsAccum is
    * always 0, so this is a no-op for sm. */
   if (snes->apuDotsAccum) {
-    snes->apuCatchupCycles += (double)snes->apuDotsAccum * APU_CYCLES_PER_MASTER;
+    double ratio = snes->pal ? APU_CYCLES_PER_MASTER_PAL : APU_CYCLES_PER_MASTER_NTSC;
+    snes->apuCatchupCycles += (double)snes->apuDotsAccum * ratio;
     snes->apuDotsAccum = 0;
   }
   if (snes->apuCatchupCycles > 10000)

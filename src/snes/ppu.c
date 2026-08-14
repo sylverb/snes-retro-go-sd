@@ -3875,7 +3875,9 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
       return val;
     }
     case 0x3f: {
-      uint8_t val = 0x3; // ppu2 version (4 bit), bit 4: ntsc/pal
+      uint8_t val = 0x3; // ppu2 version (low 4 bits)
+      if (ppu->snes && ppu->snes->pal)
+        val |= 0x10; /* bit 4: PAL */
       val |= ppu->ppu2openBus & 0x20;
       val |= ppu->countersLatched << 6;
       val |= ppu->evenFrame << 7;

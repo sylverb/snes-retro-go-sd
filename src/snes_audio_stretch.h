@@ -54,26 +54,19 @@
  * At full speed the loop converges to step == 1.0 and the pull is a straight
  * copy, so a 60 fps scene is unaffected.
  *
- * ISR-pull architecture
- * ---------------------
- * The pull runs in the DMA ISR (gw_audio.c emu_fill, called from
- * HAL_SAI_TxHalfCpltCallback / HAL_SAI_TxCpltCallback), not from the main
- * loop. The overlay registers snes_stretch_pull via emu_audio_register() after
- * audio_start_playing_full_length(). This is the same pattern music_fill uses
- * for the Music app: the ISR calls only core code, which calls the overlay's
- * pull through a registered function pointer.
- *
- * The ISR-pull architecture fixes the half-buffer resonance bug: at fps where
+ * ISR-fed DMA (pcm_attach)
+ * ------------------------
+ * The SAI ISR must not jump into RAM_EMU (no emu_audio_register from a
+ * core). Firmware pcm_fill() in gw_audio.c copies from a core-owned ring
+ * registered with pcm_attach(). Main loop: stretch_push the emulated frame,
+ * then stretch_pull into that ring. The ISR fills EVERY completed DMA half
+ * from the ring — that is what kills the half-buffer resonance: at fps where
  * frame_time is an integer multiple of the DMA period (30 fps = 2 periods),
- * the main-loop emit always wrote to the same half-buffer (dma_state landed on
- * the same selector every frame), and the other half played stale content
- * forever. Moving the pull into the ISR means every period gets exactly one
- * pull — both halves always get fresh stretcher output.
+ * a main-loop emit always wrote the same half (dma_state landed on the same
+ * selector every frame) and the other half played stale/short contents.
  *
- * Concurrency: push (main loop) and pull (ISR) share fill, rd, pushed, primed.
- * The push wraps these in a brief IRQ disable (STRETCH_IRQ_SAVE/RESTORE in
- * snes_audio_stretch.c). The ISR pull reads/writes them without further
- * protection because it cannot be preempted by the push.
+ * Concurrency: stretcher push and pull both run in the main loop. The pcm
+ * ring is SPSC (main writes head, ISR writes tail).
  */
 #pragma once
 
