@@ -174,8 +174,8 @@ and between audio catch-up chunks.
 
 - LCD and audio DMA are bus masters and **cache-blind**. Clean D-cache
 before DMA2D/SAI reads core-produced buffers in cacheable RAM.
-- Scaled present may use ABI `dma2d_ctl` — see firmware comments; poll
-with watchdog slices, do not block for 100 ms unfed.
+- Scaled present may use ABI `dma2d_m2m_rgb565_start` / `dma2d_poll`
+(bridge trampolines); poll with watchdog slices, do not block for 100 ms unfed.
 
 ---
 
@@ -266,8 +266,9 @@ In this repo after a firmware change:
 
 | Path     | Notes                                                                 |
 | -------- | --------------------------------------------------------------------- |
-| `src/main.c` | Shared CORE / GWHB skeleton (`PROJECT_KIND_*`); LCD + audio beep demo |
+| `src/main_snes.c` | SNES LakeSnes core (frame loop, present, audio, savestate) |
+| `src/snes/` | Emulator + Thumb-2 65816/SPC engines |
 
 
-Start from `src/main.c` when placing WRAM / heaps / interpreters; use the
+Start from `src/main_snes.c` / `src/snes/` for WRAM / heaps / interpreters; use the
 memory map above for ITCM / DTCM / AHB / RAM_EMU choices.

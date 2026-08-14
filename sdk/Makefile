@@ -153,7 +153,12 @@ all: $(TARGET_BIN) $(CORE_EXTRA_SEGMENT_BINS)
 $(BUILD_DIR):
 	$(V)mkdir -p $(BUILD_DIR)
 
-$(BRIDGE_OBJECTS): CFLAGS += -fno-builtin-memcpy -fno-builtin-memmove -fno-builtin-memset
+# Bridge provides freestanding memcpy/memset/memmove. GCC's
+# -ftree-loop-distribute-patterns (on at -O3) rewrites those loops into
+# calls to the same libc symbol → infinite recursion → stack HardFault
+# (PC/LR both inside memset when APU/DSP music path runs deep).
+# -fno-builtin-* alone is NOT enough on GCC 10+.
+$(BRIDGE_OBJECTS): CFLAGS += -fno-builtin-memcpy -fno-builtin-memmove -fno-builtin-memset -fno-tree-loop-distribute-patterns
 
 $(BUILD_DIR)/%.o: %.c $(REDEFINE_SYMS_FILE) | $(BUILD_DIR)
 	$(V)$(ECHO) [ CC ] $(notdir $<)

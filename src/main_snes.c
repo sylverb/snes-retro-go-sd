@@ -1,0 +1,1314 @@
+/* Generic SNES core (LakeSnes interpreter, src/snes) as a launcher
+ * system — EXPERIMENTAL baseline.
+ *
+ * Milestone 1: interpreter + the PPU line-renderer optimizations, nothing else.
+ * The measured M7-rig figure for this exact configuration is 49.2 fps (Zelda,
+ * gameplay); the first real-hardware number from this build calibrates the
+ * rig's insn-count against device cycles for every further lever (spin-skip,
+ * translator/XIP, audio HLE), which land separately.
+ *
+ * The frame loop below (dots_to_next_event / run_dots / run_frame_events) is
+ * the parity-proven event loop from tools/snes_harness/snes_main.c — it and
+ * the per-dot reference walk produce bit-identical state hashes there. Do not
+ * "improve" it here without re-running that oracle.
+ *
+ * LoROM/HiROM only. Enhancement-chip carts (SA-1, SuperFX, DSP-1, ...) are
+ * rejected at load with a message instead of a mid-game Hardfault.
+ */
+/*
+ * External Retro-Go SD core — adapted from jshsakura
+ * Core/Src/porting/snes/main_snes.c for the standalone ABI bridge.
+ */
+#include <assert.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "odroid_system.h"
+#include "gw_lcd.h"
+#include "rom_manager.h"
+#include "common.h"
+#include "gw_malloc.h"
+#include "rg_storage.h"
+#include "odroid_overlay.h"
+#include "crc32.h"
+
+#include "gw_core_bridge.h"
+
+void draw_error_screen(const char *main_line, const char *line_1, const char *line_2);
+
+/* Block until any pad edge after an error screen (draw_error_screen itself
+ * does not wait — pairing it with switch_app(0) otherwise soft-resets
+ * instantly and looks like a mysterious reboot). */
+static void snes_wait_button(void)
+{
+  odroid_gamepad_state_t pad;
+  odroid_input_read_gamepad(&pad);
+  uint32_t prev = 0;
+  for (int i = 0; i < ODROID_INPUT_MAX; i++)
+    if (pad.values[i])
+      prev |= (1u << i);
+  for (;;) {
+    wdog_refresh();
+    odroid_input_read_gamepad(&pad);
+    uint32_t now = 0;
+    for (int i = 0; i < ODROID_INPUT_MAX; i++)
+      if (pad.values[i])
+        now |= (1u << i);
+    if (now && now != prev)
+      return;
+    prev = now;
+  }
+}
+
+#include "snes/snes.h"
+#include "snes/cart.h"
+#include "snes/ppu.h"
+#include "snes/apu.h"
+#include "snes/dsp.h"
+#include "snes/cpu.h"
+#include "snes/dma.h"
+#include "snes/input.h"
+#include "snes/saveload.h"
+#include "snes/spin_skip.h"
+#include "snes_audio_stretch.h"
+#include "snes/rc_dispatch.h"
+#include "snes_profile.h"
+
+#define APPID_SNES 25
+
+bool snes_loadRom(Snes *snes, const uint8_t *data, int length);   /* snes_other.c */
+
+#define SNES_FPS            60
+#define SNES_WIDTH          256
+#define SNES_HEIGHT         224
+#define SNES_AUDIO_RATE     16000
+#define SNES_AUDIO_SAMPLES  (SNES_AUDIO_RATE / SNES_FPS)   /* 266/frame */
+
+/* Savestate stamp: a raw struct dump must refuse files this build didn't
+ * write (project rule — a stale state "loads" and restores nonsense). */
+#define SNES_STATE_MAGIC    0x31534E53u   /* "SNS1" */
+#define SNES_STATE_VERSION  2   /* v2: + controller shift registers (see below) */
+
+/* ---- hooks the snes lib links against ------------------------------------
+ * Super Metroid RTL hooks; a generic core has no reimplementation so they
+ * are inert (same shims as the host harness / M7 rig). */
+int  CpuOpcodeHook(uint32_t addr) { (void)addr; return 0; }
+bool HookedFunctionRts(int level) { (void)level; return false; }
+bool g_fail;
+bool g_new_ppu = true;                 /* the fast line renderer, as measured */
+
+static Snes *g_the_snes;
+
+#ifdef SNES_SMW_HLE_PRODUCT
+extern int g_wire_on;
+void wire_apu_write(Snes *snes, uint32_t adr, uint8_t val);
+int wire_try_swap(Snes *snes, int frame);
+void wire_frame_audio(int16_t *buf, int n);
+bool wire_configure_rom(const uint8_t *rom, uint32_t len);
+void wire_prepare_save(void);
+void wire_restore_after_load(Snes *snes);
+static int smw_hle_frame;
+#endif
+
+/* The lib routes $2140-43 writes through this (snes.c). Catch the APU up and
+ * write the CPU-visible mailbox — NOT apu_cpuWrite(), which is the SPC's own
+ * bus and would leave inPorts stale (boot then spins on the port echo). */
+void RtlApuWrite(uint32_t adr, uint8_t val) {
+#ifdef SNES_SMW_HLE_PRODUCT
+  wire_apu_write(g_the_snes, adr, val);
+#else
+  snes_catchupApu(g_the_snes);
+  g_the_snes->apu->inPorts[adr & 0x3] = val;
+#endif
+}
+
+void Die(const char *s) {
+  printf("SNES Die: %s\n", s);
+  assert(!"snes core died");
+}
+void Warning(const char *s) { (void)s; }
+
+extern bool g_ppu_skip_render;   /* ppu.c: skip compositing on dropped frames */
+
+/* ---- state ---------------------------------------------------------------- */
+static Snes *snes;
+/* 128 KB WRAM lives in the overlay BSS (like the SM port's g_ram): the AHB
+ * pool is only 120 KB total and the Apu (~66 KB) already comes from it. */
+static uint8_t snes_wram[0x20000];
+static int16_t audio_buf[SNES_AUDIO_SAMPLES];  /* mono frame mix from the DSP  */
+
+/* ---- event loop (verbatim from tools/snes_harness/snes_main.c) ------------ */
+#ifdef SNES_BUS_IN_ITCM
+#define SNES_ITCM_SCHED __attribute__((section(".itcm_snes_interp.thumb2.bus")))
+#else
+#define SNES_ITCM_SCHED
+#endif
+
+/* Keep the scheduler in ITCM with cpu_runOpcode. At -O3 gcc already inlines
+ * these into app_main_snes (also ITCM); the section is the safety net if a
+ * call is not inlined. -ffunction-sections drops a section attribute that is
+ * only on the definition, so it is on the prototype too. */
+static int dots_to_next_event(Snes *s) SNES_ITCM_SCHED;
+static void apply_irq_match(Snes *s) SNES_ITCM_SCHED;
+static int run_one_opcode(Snes *s) SNES_ITCM_SCHED;
+static void cpu_tick(Snes *s) SNES_ITCM_SCHED;
+static void run_dots(Snes *s, int dots) SNES_ITCM_SCHED;
+static void run_frame_events(Snes *s) SNES_ITCM_SCHED;
+
+static int SNES_ITCM_SCHED dots_to_next_event(Snes *s) {
+  int h = s->hPos;
+  if (h == 0 || h == 512 || h == 1024) return 0;
+  if (s->hIrqEnabled && h == s->hTimer * 4) return 0;
+  int next = 1362;
+  if (h < 512)       next = 512;
+  else if (h < 1024) next = 1024;
+  if (s->hIrqEnabled) {
+    int t = s->hTimer * 4;
+    if (t > h && t < next) next = t;
+  }
+  return next - h;
+}
+
+static void SNES_ITCM_SCHED apply_irq_match(Snes *s) {
+  if (!(s->hIrqEnabled || s->vIrqEnabled)) return;
+  if (s->vIrqEnabled && s->vPos != s->vTimer) return;
+  if (s->hIrqEnabled && s->hPos != s->hTimer * 4) return;
+  s->inIrq = true;
+  s->cpu->irqWanted = true;
+}
+
+/* One real interpreter call, with the spin learner watching (harness-identical:
+ * tools/snes_spin compiles the same spin_skip.c and gates skip-off vs skip-on to
+ * bit-identical state+audio hashes). */
+static int SNES_ITCM_SCHED run_one_opcode(Snes *s) {
+  Cpu *cpu = s->cpu;
+#if defined(SNES_SPIN_SKIP) && !SNES_SPIN_REPLAY_ONLY
+  const bool learn = spin_engaged();   /* sample before the opcode; see header */
+  uint32_t pc24 = 0;
+  int disp = 0;
+  if (learn) {
+    pc24 = ((uint32_t)cpu->k << 16) | cpu->pc;
+    disp = (cpu->nmiWanted || (cpu->irqWanted && !cpu->i) || cpu->waiting) && !cpu->stopped;
+  }
+#endif
+  s->cpuMemOps = 0;
+  int cycles = SNES_PROF_CPU_CALL(CPU_RUN_OPCODE(cpu));
+  /* 6*cycles + 2*memOps -- identical to the old 8-per-access charge plus
+   * (cycles - memOps)*6, but paid once instead of on every bus access. */
+  s->cpuCyclesLeft += cycles * 6 + s->cpuMemOps * 2;
+#if defined(SNES_SPIN_SKIP) && !SNES_SPIN_REPLAY_ONLY
+  if (learn) SNES_PROF_SPIN_CALL(spin_note_real(cpu, pc24, (uint8_t)s->cpuCyclesLeft, disp));
+#endif
+  return cycles;
+}
+
+static void SNES_ITCM_SCHED cpu_tick(Snes *s) {
+  if (dma_cycle(s->dma)) return;
+  if (s->cpuCyclesLeft == 0) run_one_opcode(s);
+  s->cpuCyclesLeft -= 2;
+}
+
+static void SNES_ITCM_SCHED run_dots(Snes *s, int dots) {
+  Cpu *cpu = s->cpu;
+  bool dma_active = s->dma->dmaBusy || s->dma->hdmaTimer > 0;
+  while (dots > 0) {
+    if (dma_active) {
+      dma_cycle(s->dma);
+      s->apuDotsAccum += 2;
+      s->hPos += 2; dots -= 2;
+      dma_active = s->dma->dmaBusy || s->dma->hdmaTimer > 0;
+      continue;
+    }
+    bool started_dma = false;
+    if (s->cpuCyclesLeft == 0) {
+#ifdef SNES_SPIN_SKIP
+      if (g_spin.on &&
+          !cpu->nmiWanted && !cpu->irqWanted && !cpu->waiting && !cpu->stopped &&
+          !s->hIrqEnabled &&
+          !(s->vIrqEnabled && s->vPos == s->vTimer) &&
+          (((uint32_t)cpu->k << 16) | cpu->pc) == g_spin.pc[g_spin.idx]) {
+        s->cpuCyclesLeft += g_spin.charge[g_spin.idx];
+        g_spin.idx = (g_spin.idx + 1) % g_spin.len;
+        cpu->k  = (uint8_t)(g_spin.pc[g_spin.idx] >> 16);
+        cpu->pc = (uint16_t)g_spin.pc[g_spin.idx];
+        g_spin.ops_virtual++;
+      } else
+#endif
+      {
+        apply_irq_match(s);
+        run_one_opcode(s);
+        started_dma = s->dma->dmaBusy || s->dma->hdmaTimer > 0;
+      }
+    }
+    int step;
+    if (s->cpuCyclesLeft >= 2 && !started_dma) {
+      step = s->cpuCyclesLeft;
+      if (step > dots) step = dots;
+      s->cpuCyclesLeft -= (uint8_t)step;
+    } else {
+      step = 2;
+      s->cpuCyclesLeft -= 2;
+    }
+    s->apuDotsAccum += step;
+    s->hPos += step; dots -= step;
+    dma_active = started_dma;
+  }
+}
+
+static void SNES_ITCM_SCHED run_frame_events(Snes *s) {
+  extern void wdog_refresh(void);
+  uint16_t last_v = 0xffff;
+  for (;;) {
+    if (s->vPos != last_v) {
+      last_v = s->vPos;
+      wdog_refresh();
+    }
+    s->apuDotsAccum += 2;
+    snes_handle_pos_stuff(s);
+    cpu_tick(s);
+    if (s->hPos == 0 && s->vPos == 0) break;
+    run_dots(s, dots_to_next_event(s));
+  }
+  wdog_refresh();
+  snes_catchupApu(s);
+  spin_frame_tick();   /* auto-gate: park the learner on non-spinning carts */
+#ifdef SNES_SMW_HLE_PRODUCT
+  wire_try_swap(s, smw_hle_frame++);
+#endif
+}
+
+/* ---- input ----------------------------------------------------------------
+ * LakeSnes input1->currentState bit layout (auto-joypad order):
+ * 0=B 1=Y 2=Select 3=Start 4=Up 5=Down 6=Left 7=Right 8=A 9=X 10=L 11=R.
+ * Two face buttons on the unit: A→A, B→B; GAME→X, TIME→Y so ALttP's map/item
+ * screens stay reachable; START/SELECT as themselves (Zelda-edition buttons). */
+static uint16_t read_snes_pad(odroid_gamepad_state_t *joy) {
+  uint16_t s = 0;
+  if (joy->values[ODROID_INPUT_B])      s |= 1u << 0;
+  if (joy->values[ODROID_INPUT_Y])      s |= 1u << 1;   /* TIME  = SNES Y      */
+  if (joy->values[ODROID_INPUT_SELECT]) s |= 1u << 2;
+  if (joy->values[ODROID_INPUT_START])  s |= 1u << 3;
+  if (joy->values[ODROID_INPUT_UP])     s |= 1u << 4;
+  if (joy->values[ODROID_INPUT_DOWN])   s |= 1u << 5;
+  if (joy->values[ODROID_INPUT_LEFT])   s |= 1u << 6;
+  if (joy->values[ODROID_INPUT_RIGHT])  s |= 1u << 7;
+  if (joy->values[ODROID_INPUT_A])      s |= 1u << 8;
+  if (joy->values[ODROID_INPUT_X])      s |= 1u << 9;   /* GAME  = SNES X      */
+  return s;
+}
+
+/* ---- video ----------------------------------------------------------------
+ * Render into a PRIVATE persistent framebuffer, then copy the complete visible
+ * 320x240 image to whichever LCD buffer is active.  This keeps both LCD buffers
+ * complete across swaps/overlays.  SNES_DIRECT_VIDEO lets the PPU write its RGB565
+ * scanlines directly into that private framebuffer, removing the old 512-byte
+ * scratch-to-frame memcpy on every visible line. */
+#define SNES_TOP_MARGIN  ((GW_LCD_HEIGHT - SNES_HEIGHT) / 2)   /* (240-224)/2 = 8 */
+#define SNES_LEFT_MARGIN ((GW_LCD_WIDTH - SNES_WIDTH) / 2)     /* (320-256)/2 = 32 */
+#ifdef SNES_DIRECT_VIDEO
+/* Overscan can produce 240 lines.  Starting at row 8 therefore needs eight
+ * hidden tail rows; present_frame still copies only the visible 240 rows. */
+#define SNES_FRAME_ROWS (GW_LCD_HEIGHT + SNES_TOP_MARGIN)
+#else
+#define SNES_FRAME_ROWS GW_LCD_HEIGHT
+static uint16_t snes_line[256];
+#endif
+static uint16_t snes_frame[GW_LCD_WIDTH * SNES_FRAME_ROWS] __attribute__((aligned(8)));
+
+#ifdef SNES_LOAD_DIAG
+/* DWT profiling accumulators for the SNES_LOAD_DIAG block further below.
+ * Defined here rather than in the generated apu.c (where they used to live)
+ * because SNES_APU_SOURCE replaces that file with the audio HLE's apu_wire.c
+ * whenever SNES_SMW_HLE=1 / SNES_NSPC_HLE=1 -- so the definitions dropped out
+ * of the link precisely when HLE was enabled, and SNES_LOAD_DIAG=1 could not
+ * be combined with it. That combination is the interesting one (HLE is what
+ * ships), and it was never profiled on device for exactly this reason.
+ * main_snes.c always compiles, so the counters always exist; the instrumented
+ * apu.c/dsp.c reach them as externs through the forced -include of
+ * snes_diag_accum.h. With HLE active nothing increments the spc counter --
+ * a 0 there is the correct reading, not a missing probe: the SPC700
+ * interpreter genuinely no longer runs. */
+uint64_t g_diag_spc_cycles = 0;
+uint64_t g_diag_dsp_cycles = 0;
+uint64_t g_diag_dsp_echo_cycles = 0;
+#endif
+
+#ifndef SNES_DIRECT_VIDEO
+static void snes_blit_line(unsigned y, const uint16_t *line) {
+  if (y < 1) return;   /* y is 1-based */
+  unsigned row = (y - 1) + SNES_TOP_MARGIN;
+  if (row >= GW_LCD_HEIGHT) return;   /* clip overscan past the panel */
+  memcpy(snes_frame + row * GW_LCD_WIDTH + SNES_LEFT_MARGIN, line, sizeof(snes_line));
+}
+#endif
+
+static void render_frame_into_active_buffer(void) {
+#ifdef SNES_DIRECT_VIDEO
+  g_ppu_line_cb = NULL;
+  PpuBeginDrawing(snes->ppu,
+                  (uint8_t *)(snes_frame + SNES_TOP_MARGIN * GW_LCD_WIDTH +
+                              SNES_LEFT_MARGIN),
+                  GW_LCD_WIDTH * sizeof(uint16_t), 0);
+#else
+  g_ppu_line_cb = &snes_blit_line;
+  PpuBeginDrawing(snes->ppu, (uint8_t *)snes_line, 0, 0);  /* pitch 0: every line here */
+#endif
+}
+
+/* Async RGB565 M2M present via firmware dma2d_m2m_rgb565_start / dma2d_poll
+ * (objcopy remaps to core_* ABI trampolines). Same flow as integrated
+ * jshsakura SNES: kick blit, run audio, then poll. Cache clean stays local
+ * (CMSIS); HAL lives only in the firmware. */
+#ifdef SNES_PRESENT_DMA2D
+static bool snes_dma2d_pending;
+
+static void present_frame_wait(void) {
+  if (!snes_dma2d_pending) return;
+  for (int i = 0; i < 10; i++) {
+    wdog_refresh();
+    /* 3 == HAL_TIMEOUT — keep polling until done or hard error. */
+    if (dma2d_poll(10) != 3u)
+      break;
+  }
+  wdog_refresh();
+  snes_dma2d_pending = false;
+}
+#else
+static void present_frame_wait(void) {}
+#endif
+
+static void present_frame(void) {
+  uint16_t *dst = lcd_get_active_buffer();
+  odroid_display_scaling_t scaling = odroid_display_get_scaling_mode();
+
+  if (scaling == ODROID_DISPLAY_SCALING_OFF) {
+    /* 1:1 centred (256x224 in 320x240): snes_frame already has black borders
+     * baked in (cleared once at init). DMA2D moves the 320x240 straight copy
+     * into the background so the CPU can spend that time on audio/pacing
+     * instead of blocked on an uncached memcpy — the caller MUST reach
+     * present_frame_wait() before touching dst again. */
+#ifdef SNES_PRESENT_DMA2D
+    /* snes_frame lives in cacheable RAM_EMU; SNES_DIRECT_VIDEO's PPU write
+     * this frame's pixels via normal cached stores. DMA2D is a bus master
+     * and cache-blind, so any dirty line not yet evicted would be read as
+     * stale — clean (not invalidate: the next frame's PPU render is about
+     * to overwrite this same buffer through the cache again) before
+     * handing the address to hardware. */
+    SCB_CleanDCache_by_Addr((uint32_t *)snes_frame, sizeof(snes_frame));
+    if (dma2d_m2m_rgb565_start((uint32_t)(uintptr_t)snes_frame,
+                               (uint32_t)(uintptr_t)dst,
+                               GW_LCD_WIDTH, GW_LCD_HEIGHT) == 0) {
+      snes_dma2d_pending = true;
+      return;
+    }
+    /* DMA2D unavailable for some reason — fall back to the plain CPU copy. */
+#endif
+    /* Revert switch: drop -DSNES_PRESENT_DMA2D to force this path
+     * unconditionally (present_frame_wait() stays a safe no-op either way). */
+    memcpy(dst, snes_frame, GW_LCD_WIDTH * GW_LCD_HEIGHT * sizeof(uint16_t));
+    return;
+  }
+
+  if (scaling == ODROID_DISPLAY_SCALING_FULL) {
+    /* Stretch 256x224 → 320x240 (fills the panel, slight aspect distortion).
+     * Nearest-neighbour: for each dest pixel, pick the closest source pixel. */
+    for (int y = 0; y < GW_LCD_HEIGHT; y++) {
+      int sy = (y * SNES_HEIGHT) / GW_LCD_HEIGHT;
+      const uint16_t *srow = snes_frame + (sy + SNES_TOP_MARGIN) * GW_LCD_WIDTH + SNES_LEFT_MARGIN;
+      uint16_t *drow = dst + y * GW_LCD_WIDTH;
+      for (int x = 0; x < GW_LCD_WIDTH; x++)
+        drow[x] = srow[(x * SNES_WIDTH) / GW_LCD_WIDTH];
+    }
+    return;
+  }
+
+  /* FIT (and CUSTOM, treated the same): aspect-preserving. SNES 256:224 =
+   * 8:7 ≈ 1.143. The LCD 320:240 = 4:3 ≈ 1.333 is wider, so fill the height
+   * (240) and letterbox the width: fit_w = 240 * 256/224 ≈ 274, side borders
+   * ≈ 23 px each. */
+  {
+    int fit_w = (SNES_WIDTH * GW_LCD_HEIGHT + SNES_HEIGHT / 2) / SNES_HEIGHT;
+    int lpad = (GW_LCD_WIDTH - fit_w) / 2;
+    for (int y = 0; y < GW_LCD_HEIGHT; y++) {
+      int sy = (y * SNES_HEIGHT) / GW_LCD_HEIGHT;
+      const uint16_t *srow = snes_frame + (sy + SNES_TOP_MARGIN) * GW_LCD_WIDTH + SNES_LEFT_MARGIN;
+      uint16_t *drow = dst + y * GW_LCD_WIDTH;
+      for (int x = 0; x < lpad; x++) drow[x] = 0;          /* left border */
+      for (int x = 0; x < fit_w; x++)
+        drow[lpad + x] = srow[(x * SNES_WIDTH) / fit_w];   /* scaled image */
+      for (int x = lpad + fit_w; x < GW_LCD_WIDTH; x++) drow[x] = 0;  /* right */
+    }
+  }
+}
+
+/* Present the last rendered frame and draw the in-game overlay on top. Used both
+ * as the normal per-frame present and as the overlay's repaint callback, so the
+ * pause menu keeps the game behind it instead of a stale/black background.
+ * Fully synchronous (waits out any DMA2D copy immediately) — callers that want
+ * the async overlap split present_frame()/present_frame_wait() themselves; see
+ * the main loop below. */
+static void blit(void) {
+  present_frame();
+  present_frame_wait();
+  common_ingame_overlay();
+}
+
+/* ---- audio ----------------------------------------------------------------
+ * Top the DSP up to one frame of samples (534 stereo pairs internally) and
+ * downmix to 16 kHz mono, exactly like the harness/rig. */
+static void snes_pcm_emit(void);
+
+static void snes_pcm_submit(void) {
+  if (snes->apu) {
+#ifdef SNES_SMW_HLE_PRODUCT
+    if (g_wire_on) {
+      wire_frame_audio(audio_buf, SNES_AUDIO_SAMPLES);
+    } else
+#endif
+    {
+    /* Ledger B, APU-exclusive scope: this whole block is what an exact wire
+     * replaces -- the SPC700/DSP top-up AND the sample extraction. Bracketing
+     * only the apu_cycle loop would undercount the recoverable cost. One scope
+     * per frame, so the probe is noise. */
+    uint32_t apu_t0 = SNES_PROF_APU_SCOPE_ENTER();
+    /* Bulk apu_run — not 17k× apu_cycle. Music makes each DSP tick expensive;
+     * the old per-cycle top-up starved WWDG (~0.4 s) and soft-reset at song
+     * start. Feed the dog between chunks. */
+    {
+      extern void wdog_refresh(void);
+      int guard = 0;
+      while (snes->apu->dsp->sampleOffset < 534) {
+        int need = 534 - snes->apu->dsp->sampleOffset;
+        int cycles = need * 32;
+        if (cycles > 2048)
+          cycles = 2048;
+        apu_run(snes->apu, cycles);
+        if ((++guard & 3) == 0)
+          wdog_refresh();
+        if (guard > 512)
+          break; /* never spin forever if sampleOffset stalls */
+      }
+    }
+    dsp_getSamples(snes->apu->dsp, audio_buf, SNES_AUDIO_SAMPLES, 1);
+    SNES_PROF_APU_SCOPE_EXIT(apu_t0);
+    }
+  } else {
+    memset(audio_buf, 0, sizeof(audio_buf));
+  }
+
+  /* Hand the frame's emulated samples to the stretcher instead of straight to
+   * the DMA. Below 60 emulated fps the DMA eats more buffers than the core
+   * fills, and the old code's answer was to write 266 samples and zero the
+   * rest of the buffer -- an audible gap every slow frame. See
+   * snes_audio_stretch.h; the emulated machine is not touched, only the rate
+   * the already-produced samples are played back at. */
+  snes_stretch_push(audio_buf, SNES_AUDIO_SAMPLES);
+  snes_pcm_emit();
+}
+
+/* Fill ONE audio-DMA buffer from the stretcher. Called once per DMA period,
+ * not once per emulated frame -- that distinction is the fix: the pacing
+ * block below calls it again for every period a slow frame ran past, so no
+ * period is left playing whatever the previous one left behind. */
+static void snes_pcm_emit(void) {
+  if (common_emu_sound_loop_is_muted())
+    return;
+  int16_t *dst = audio_get_active_buffer();
+  uint16_t dst_len = audio_get_buffer_length();
+  snes_stretch_pull(dst, dst_len);
+  int32_t factor = common_emu_sound_get_volume();
+  for (uint16_t i = 0; i < dst_len; i++)
+    dst[i] = (int16_t)(((int32_t)dst[i] * factor) >> 8);
+}
+
+/* ---- savestate -------------------------------------------------------------
+ * snes_saveload() streams every subsystem (cpu/apu+dsp/dma/ppu/cart-sram/wram)
+ * through one SaveLoadFunc; we stream it straight to the file behind a stamp.
+ * ppu_saveload rebuilds its derived caches (palette, sprite-line cache) on
+ * load, so no manual invalidation is needed here. */
+static FILE *state_file;
+static uint32_t state_bytes;
+
+static void state_write(void *ctx, void *data, size_t size) {
+  (void)ctx;
+  wdog_refresh();
+  if (state_file)
+    fwrite(data, 1, size, state_file);
+  state_bytes += size;
+}
+
+static void state_read(void *ctx, void *data, size_t size) {
+  (void)ctx;
+  wdog_refresh();
+  size_t got = state_file ? fread(data, 1, size, state_file) : 0;
+  if (got < size)
+    memset((uint8_t *)data + got, 0, size - got);
+  state_bytes += size;
+}
+
+typedef struct {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t length;    /* payload bytes after this header */
+} snes_state_header_t;
+
+/* The lib chain (snes_saveload) covers cpu/apu+dsp/dma/ppu/cart/wram but NOT
+ * the controller shift registers (Input.latchLine/latchedState) — SM never
+ * reads a port serially so the lib never needed them. Real games do: DKC
+ * manual-reads $4016 and a cold resume handed it a zeroed shift register
+ * where the live machine returns 1s after the auto-joy shift-out (found by
+ * the two-process cold-resume proof, tools/snes_save_test). Serialize them
+ * here, after the lib stream, without touching the lib. */
+static void state_io_input(SaveLoadFunc *func) {
+  Input *pads[2] = { snes->input1, snes->input2 };
+  for (int i = 0; i < 2; i++) {
+    func(NULL, &pads[i]->latchLine, sizeof(pads[i]->latchLine));
+    func(NULL, &pads[i]->latchedState, sizeof(pads[i]->latchedState));
+  }
+}
+
+static void state_stream(SaveLoadFunc *func) {
+  snes_saveload(snes, func, NULL);
+  state_io_input(func);
+}
+
+static bool snes_SaveState(const char *pathName) {
+#ifdef SNES_SMW_HLE_PRODUCT
+  wire_prepare_save();
+#endif
+  /* Pass 1: count. Pass 2: write behind an accurate header. */
+  state_file = NULL; state_bytes = 0;
+  state_stream(&state_write);
+  uint32_t payload = state_bytes;
+
+  FILE *f = fopen(pathName, "wb");
+  if (!f) return false;
+  snes_state_header_t h = { SNES_STATE_MAGIC, SNES_STATE_VERSION, payload };
+  if (fwrite(&h, 1, sizeof(h), f) != sizeof(h)) { fclose(f); return false; }
+  state_file = f; state_bytes = 0;
+  state_stream(&state_write);
+  fclose(f);
+  state_file = NULL;
+  return state_bytes == payload;
+}
+
+static bool snes_LoadState(const char *pathName) {
+  FILE *f = fopen(pathName, "rb");
+  if (!f) return false;
+  snes_state_header_t h;
+  if (fread(&h, 1, sizeof(h), f) != sizeof(h) ||
+      h.magic != SNES_STATE_MAGIC || h.version != SNES_STATE_VERSION) {
+    /* Not ours / other build: refuse rather than restore nonsense. */
+    fclose(f);
+    return false;
+  }
+  /* Refuse BEFORE touching the machine, not after: (a) the payload must be
+   * exactly the size this build streams (a lying length would otherwise be
+   * caught only after the machine is clobbered), (b) the file must actually
+   * contain it (state_read zero-fills past EOF, so a truncated file would
+   * "load" a half-zeroed machine and report success — proven by the refusal
+   * test before this check existed). */
+  /* Dry run with the WRITE counter (file==NULL: counts, reads nothing into
+   * the machine — state_read would zero-fill the live machine here). */
+  state_file = NULL; state_bytes = 0;
+  state_stream(&state_write);          /* what this build expects, in bytes */
+  uint32_t expected = state_bytes;
+  fseek(f, 0, SEEK_END);
+  long fsize = ftell(f);
+  if (h.length != expected ||
+      fsize != (long)(sizeof(h) + expected)) {
+    fclose(f);
+    return false;
+  }
+  fseek(f, sizeof(h), SEEK_SET);
+  state_file = f; state_bytes = 0;
+  state_stream(&state_read);
+  fclose(f);
+  state_file = NULL;
+  lcd_clear_active_buffer();
+  /* A load replaces the whole machine: a learned spin pattern (and its purity
+   * sequence history) now describes a machine that no longer exists. Relearn. */
+  spin_reset();
+#ifdef SNES_SMW_HLE_PRODUCT
+  wire_restore_after_load(snes);
+#endif
+  return state_bytes == h.length;
+}
+
+static void *snes_Screenshot(void) {
+  lcd_wait_for_vblank();
+  return lcd_get_active_buffer();
+}
+
+#ifdef SNES_SMW_HLE_PRODUCT
+/* One-shot, quit-time-only flush of the audio-HLE swap status. Registered
+ * below as BOTH sram_save_cb (fires from odroid_system_switch_app, i.e. the
+ * in-game pause menu's Quit/Save&Quit) and shutdown_cb (fires from
+ * odroid_system_shutdown, i.e. power-off/standby) -- SNES has no cart-SRAM
+ * handler of its own to conflict with, and both call sites are single,
+ * quit-time events, never the frame loop (rule-no-sd-write-during-play).
+ * The load-time probe further below can only ever say the gate was ARMED
+ * (wire_try_swap() needs ~180+ live frames it doesn't have yet at load) --
+ * this is what actually answers whether the swap happened, and if not, the
+ * concrete reason, without needing a second device round-trip to find out.
+ * Appends a second line to the same /snes_diag.txt so one file covers both
+ * halves. */
+static void snes_wire_diag_flush(void) {
+  extern int g_wire_enable, g_wire_on;
+  FILE *df = fopen("/snes_diag.txt", "a");
+  if (!df) return;
+  /* g_wire_attempt_count/g_wire_swap_frame/g_wire_last_fail_reason are
+   * smw_exact_wire.c-specific (its own per-attempt diagnostics) -- they
+   * only exist when SMW's exact backend is actually compiled
+   * (SNES_SMW_HLE_PRESENT). A generic-only build (SNES_NSPC_HLE=1,
+   * SNES_SMW_HLE=0) has neither smw_exact_wire.c nor those globals; an
+   * unguarded extern here would be a link error in that configuration. */
+#ifdef SNES_SMW_HLE_PRESENT
+  extern int g_wire_attempt_count, g_wire_swap_frame;
+  extern const char *g_wire_last_fail_reason;
+  fprintf(df, "SNES wire at quit: g_wire_enable=%d g_wire_on=%d attempts=%d "
+              "swap_frame=%d last_fail=[%s]\n",
+          g_wire_enable, g_wire_on, g_wire_attempt_count, g_wire_swap_frame,
+          g_wire_last_fail_reason);
+#else
+  fprintf(df, "SNES wire at quit: g_wire_enable=%d g_wire_on=%d "
+              "(generic-only build, no SMW-exact attempt/fail diagnostics)\n",
+          g_wire_enable, g_wire_on);
+#endif
+  fclose(df);
+}
+#endif
+
+/* ---- ROM loading -----------------------------------------------------------
+ * The cart stays memory-mapped in external flash (flash-cache machinery); the
+ * core only reads it. Copier headers (512 bytes) are skipped in place. */
+static const uint8_t *snes_rom;
+static uint32_t snes_rom_len;
+
+/* $ffd6 (ROM type): 0=ROM 1=ROM+RAM 2=ROM+RAM+battery; 3+ = coprocessor
+ * (DSP-x/SA-1/SuperFX/...). The DSP-1 family (high nibble 0, low nibble 3-5)
+ * has HLE support in dsp1_hle.c — those are allowed through. Every other
+ * coprocessor (SuperFX/SA-1/Cx4/S-DD1/...) is still rejected. Find the header
+ * the same way the loader scores it: the offset whose checksum ^ complement is
+ * 0xFFFF wins; if neither validates, let snes_loadRom decide. */
+static bool cart_needs_coprocessor(const uint8_t *rom, uint32_t len) {
+  static const uint32_t offs[2] = { 0x7fb0, 0xffb0 };   /* LoROM, HiROM */
+  for (int i = 0; i < 2; i++) {
+    if (offs[i] + 0x30 > len) continue;
+    const uint8_t *h = rom + offs[i];
+    uint16_t cks  = h[0x2e] | (h[0x2f] << 8);
+    uint16_t icks = h[0x2c] | (h[0x2d] << 8);
+    if ((cks ^ icks) == 0xffff) {
+      uint8_t romType = h[0x26];   /* $ffd6 = header+0x26 */
+      /* high nibble 0 = DSP family (HLE in dsp1_hle.c); anything else with
+       * romType >= 3 is a coprocessor we don't support yet */
+      if (romType >= 0x03 && (romType >> 4) != 0)
+        return true;
+    }
+  }
+  return false;
+}
+
+/* ---- rc SMW native optimization ---------------------------------------------
+ * Per-ROM static recompilation: SMW's 270 hottest 65816 sites translated to C.
+ * The overlay's cpu_runOpcode fast path (g_rc_active) dispatches to sites
+ * instead of interpreting. Rig-measured: -42.3% insn/frame on SMW.
+ *
+ * ITCM-resident: the rc hot subset (270 sites, ~12 KB) is linked at ITCM VMA
+ * and copied there by run_internal_emu BEFORE app_main runs. Zero wait-state
+ * execution — no QSPI cache, no sentinel patching, no XIP thrash.
+ * rc takes priority over spin-skip (rc replaces the interpreter entirely). */
+#define RC_SMW_MAGIC     0x4D534352u   /* 'RCSM' little-endian — blob header */
+
+/* Diag: code-region hash computed at activation time, reported in profile2 so
+ * a mismatch (user's dump has different code at translated PCs) is visible
+ * without a debugger. */
+static uint32_t s_rc_diag_crc = 0;   /* computed code hash (name kept for diag fmt) */
+static uint32_t s_rc_diag_exp = 0;   /* expected code hash from blob header */
+
+/* Blob header layout (matches rc_smw_sites.c's rc_smw_header). Pointer fields
+ * are linked at ITCM VMA directly — no sentinel patching needed. */
+typedef struct {
+  uint32_t magic;
+  uint32_t nsites;
+  uint32_t code_hash;   /* FNV-1a of consumed bytes (opcode+operands) at all site PCs */
+  const uint32_t *addrs;   /* ITCM VMA of rc_addrs[] */
+  const void **fns;        /* ITCM VMA of rc_fns[] */
+  const uint8_t *lens;     /* ITCM VMA of rc_site_lens[] */
+} rc_smw_header_t;
+
+/* The header symbol — defined in rc_smw_sites.c, linked into .itcm_rc_hot
+ * (ITCM VMA). Available as a direct extern because run_internal_emu copies the
+ * ITC blob to ITCM before app_main runs. */
+extern const rc_smw_header_t rc_smw_header;
+
+/* SNES-overlay-resident hash storage (defined in rc_smw_sites.c, linked into
+ * .overlay_snes_bss). Passed to rc_dispatch_init() so it never touches the
+ * 81 KB DTCM heap. */
+extern rc_entry_t rc_hash_storage[];
+extern uint32_t rc_bank_off[];
+extern uint32_t rc_bank_mask[];
+
+/* SMW title hash (FNV-1a of 21-byte internal title at LoROM 0x7FC0).
+ * Same value the spin-skip whitelist uses — quick reject for non-SMW ROMs. */
+#define RCSMW_TITLE_HASH  0xFB0BD0ECu
+
+static bool rc_smw_activate(const uint8_t *rom, uint32_t len) {
+#if RCSMW
+  if (len == 0 || rom == NULL) return false;
+
+  /* Quick reject: SMW internal title hash (21 bytes at LoROM 0x7FC0).
+   * Same FNV-1a the spin-skip whitelist uses — cheap reject for non-SMW ROMs. */
+  if (len < 0x7FD5) return false;
+  uint32_t th = 0x811C9DC5u;
+  for (int i = 0; i < 21; i++) {
+    th ^= rom[0x7FC0 + i];
+    th *= 0x01000193u;
+  }
+  if (th != RCSMW_TITLE_HASH) {
+    printf("rc_smw: not SMW (title hash %08lX != %08lX)\n",
+           (unsigned long)th, (unsigned long)RCSMW_TITLE_HASH);
+    return false;
+  }
+
+  /* The header is a direct symbol at ITCM VMA — code already copied by
+   * run_internal_emu. No fopen/QSPI cache/sentinel patching. */
+  const rc_smw_header_t *hdr = &rc_smw_header;
+  if (hdr->magic != RC_SMW_MAGIC || hdr->nsites == 0) {
+    printf("rc_smw: bad header (magic=0x%08lX nsites=%lu)\n",
+           (unsigned long)hdr->magic, (unsigned long)hdr->nsites);
+    return false;
+  }
+
+  /* Code-region hash gate: FNV-1a of consumed bytes (opcode + operands) at
+   * every translated site PC. "The bytes are identity" — same principle as
+   * GBA M4A HLE. Accepts any dump/patch/hack whose CODE at the translated PCs
+   * is byte-identical to the reference dump; rejects any code change.
+   * Text/graphics hacks (different data, same code) pass correctly. */
+  uint32_t rom_mask = len - 1;
+  uint32_t ch = 0x811C9DC5u;
+  for (uint32_t i = 0; i < hdr->nsites; i++) {
+    uint32_t a = hdr->addrs[i];
+    uint8_t bank = a >> 16;
+    uint16_t off = a & 0xFFFF;
+    uint32_t idx = ((uint32_t)(bank & 0x7F) << 15) | (off & 0x7FFF);
+    int nbytes = 1 + hdr->lens[i];   /* opcode + operand bytes */
+    for (int j = 0; j < nbytes; j++) {
+      ch ^= rom[(idx + j) & rom_mask];
+      ch *= 0x01000193u;
+    }
+  }
+  s_rc_diag_crc = ch;
+  s_rc_diag_exp = hdr->code_hash;
+  if (ch != hdr->code_hash) {
+    printf("rc_smw: code hash mismatch (got %08lX want %08lX) — not activating\n",
+           (unsigned long)ch, (unsigned long)hdr->code_hash);
+    return false;
+  }
+
+  /* Build the dispatch table. rc_fns[] pointers are at ITCM VMA (linked
+   * directly, no patching). The hash storage lives in SNES overlay BSS
+   * (rc_smw_sites.c) — NOT the DTCM heap. After this call, g_rc_active is
+   * true and cpu_runOpcode uses the rc fast path. */
+  rc_dispatch_init(rc_hash_storage, rc_bank_off, rc_bank_mask,
+                   hdr->addrs, hdr->nsites, (void (**)(Cpu *))hdr->fns);
+  printf("rc_smw: activated — %lu sites, ITCM header at %p\n",
+         (unsigned long)hdr->nsites, hdr);
+  return true;
+#else
+  (void)rom; (void)len;
+  return false;
+#endif
+}
+
+/* In ITCM with the engine it drives — same as jshsakura monolithic overlay
+ * (avoids BL veneers to cpu_runOpcode / snes_cpuRead every opcode). */
+#ifdef SNES_BUS_IN_ITCM
+__attribute__((section(".itcm_snes_interp.thumb2.bus")))
+#endif
+void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
+{
+  gw_core_bridge_init();
+  ram_start = (uint32_t)(uintptr_t)&__CORE_BSS_END__;
+  ram_init();
+  /* Firmware already dtc_init()'d in emulator_start() (ACTIVE_FILE was copied
+   * to AHB first). Rewind again so this core owns a known-empty DTCM bump —
+   * mem_ctl(GW_MEM_OP_INIT, GW_MEM_DTC). Do not call this after dtc_* allocs. */
+  dtc_init();
+
+  SystemClock_Config(3);
+
+  odroid_gamepad_state_t joystick;
+  odroid_dialog_choice_t options[] = {
+      ODROID_DIALOG_CHOICE_LAST
+  };
+
+  if (start_paused) {
+    common_emu_state.pause_after_frames = 2;
+    odroid_audio_mute(true);
+  } else {
+    common_emu_state.pause_after_frames = 0;
+  }
+  common_emu_state.frame_time_10us = (uint16_t)(100000 / SNES_FPS + 0.5f);
+  lcd_set_refresh_rate(SNES_FPS);
+
+  odroid_system_init(APPID_SNES, SNES_AUDIO_RATE);
+#ifdef SNES_SMW_HLE_PRODUCT
+  odroid_system_emu_init(&snes_LoadState, &snes_SaveState, &snes_Screenshot,
+                         &snes_wire_diag_flush, NULL, &snes_wire_diag_flush, NULL);
+#else
+  odroid_system_emu_init(&snes_LoadState, &snes_SaveState, &snes_Screenshot,
+                         NULL, NULL, NULL, NULL);
+#endif
+
+  /* Defer audio_start_playing until after ROM load: SAI DMA running during
+   * the multi-100KB snes_reset memsets has been a HardFault suspect. */
+
+  memset(snes_wram, 0, sizeof(snes_wram));
+
+  if (!ACTIVE_FILE || !ACTIVE_FILE->path[0]) {
+    printf("snes: ACTIVE_FILE missing\n");
+    draw_error_screen("SNES ROM path missing", "ACTIVE_FILE unset", "Press a button");
+    lcd_swap();
+    snes_wait_button();
+    odroid_system_switch_app(0);
+    return;
+  }
+  printf("snes: cache '%s'\n", ACTIVE_FILE->path);
+
+  uint32_t sz = 0;
+  const uint8_t *rom = odroid_overlay_cache_file_in_flash(ACTIVE_FILE->path, &sz, false);
+  printf("snes: cache done rom=%p sz=%lu\n", rom, (unsigned long)sz);
+  if (rom && sz > 512 && (sz % 1024) == 512) {   /* copier header */
+    rom += 512;
+    sz  -= 512;
+  }
+  snes_rom = rom; snes_rom_len = sz;
+
+  /* Flash program may leave stale D-cache lines for this window — drop them
+   * before the CPU walks the image (header score / reset vector / XIP fetch). */
+  if (rom && sz) {
+    SCB_InvalidateDCache_by_Addr((void *)(uintptr_t)rom, (int32_t)sz);
+    wdog_refresh();
+  }
+
+#ifdef SNES_SMW_HLE_PRODUCT
+  smw_hle_frame = 0;
+  bool wire_armed = wire_configure_rom(rom, sz);
+  printf("SNES SMW audio HLE: %s\n", wire_armed ? "armed (exact ROM)" : "LLE fallback");
+#endif
+
+  printf("snes: snes_init\n");
+  snes = snes_init(snes_wram);
+  g_the_snes = snes;
+  if (!snes || !snes->apu || !snes->apu->spc || !snes->apu->dsp ||
+      !snes->cpu || !snes->ppu || !snes->cart || !snes->dma ||
+      !snes->input1 || !snes->input2) {
+    printf("snes: snes_init failed snes=%p apu=%p spc=%p dsp=%p cpu=%p dma=%p\n",
+           snes,
+           snes ? snes->apu : NULL,
+           (snes && snes->apu) ? snes->apu->spc : NULL,
+           (snes && snes->apu) ? snes->apu->dsp : NULL,
+           snes ? snes->cpu : NULL,
+           snes ? snes->dma : NULL);
+    draw_error_screen("SNES init failed", "(out of memory?)", "Press a button");
+    lcd_swap();
+    snes_wait_button();
+    odroid_system_switch_app(0);
+    return;
+  }
+  printf("snes: snes_init ok apu=%p spc=%p dsp=%p\n",
+         (void *)snes->apu,
+         snes->apu ? (void *)snes->apu->spc : NULL,
+         snes->apu ? (void *)snes->apu->dsp : NULL);
+  /* rc SMW activation takes priority over spin-skip. If the ITCM metadata or
+   * ROM identity check fails, fall back to the spin-skip whitelist. */
+  printf("snes: whitelist\n");
+  if (!rc_smw_activate(rom, sz)) {
+    if (rom)
+      spin_whitelist_set(rom, sz);   /* enable spin-skip only for high-spin ROMs */
+  }
+#ifdef SNES_SPIN_FORCE_ON
+  /* DIAGNOSTIC ARM. spin_table turns Zelda 3 off by name on the strength of a
+   * 25.0% skip rate against a ~50% break-even -- and BOTH of those numbers are
+   * QEMU rig instruction counts. This tree's own ledger says that rig is blind
+   * to roughly 70% of hardware time, and a replayed opcode skips the cache
+   * misses and flash stalls as well as the interpreter work, so the DEVICE
+   * break-even should sit below the rig's. Nobody has measured it. This forces
+   * the learner on regardless of the table so the third arm of a three-way
+   * device A/B exists at all; it is not a shipping path. */
+  extern bool g_spin_whitelist;
+  g_spin_whitelist = true;
+#endif
+  printf("snes: spin_reset\n");
+  spin_reset();   /* clean slate either way (spin-skip learner / rc dispatch) */
+  snes_stretch_reset();   /* and the audio stretcher: a new ROM starts empty */
+
+  printf("snes: loadRom enter\n");
+  wdog_refresh();
+  bool copro = (rom != NULL) && cart_needs_coprocessor(rom, sz);
+  printf("snes: copro=%d\n", (int)copro);
+  wdog_refresh();
+  bool loaded = (rom != NULL) && !copro && snes_loadRom(snes, rom, (int)sz);
+  printf("snes: loadRom done loaded=%d\n", (int)loaded);
+  if (!loaded) {
+    /* draw_error_screen does not wait — without a button gate, switch_app(0)
+     * soft-resets immediately (boot_magic stays BOOT_MAGIC_RESET), which looks
+     * like a mysterious reboot right after emu_init. */
+    const char *why = !rom ? "ROM cache failed"
+                    : copro ? "coprocessor/mapper"
+                    : "snes_loadRom failed";
+    printf("snes: load failed: %s (sz=%lu)\n", why, (unsigned long)sz);
+    draw_error_screen("Unsupported SNES cartridge", why, "Press a button");
+    lcd_swap();
+    snes_wait_button();
+    odroid_system_switch_app(0);
+    return;
+  }
+  /* Defer SAI until the loop: starting DMA during/right after the 64 KB ARAM
+   * wipe raced the bus on earlier bring-up builds. */
+  printf("snes: ROM loaded, entering loop\n");
+  int audio_started = 0;
+  /* The loader (GNW_SNES_CORE build) already points cart->rom straight at the
+   * flash-cached image — no malloc'd copy exists to free. Do NOT free cart->rom
+   * here: it is read-only flash, not heap, and the header-skip may have offset
+   * it past a copier header (snes_rom + 0x200). */
+
+  /* The load-time /snes_diag.txt probe lived here: ROM title, 64K checksum,
+   * dsp1/ramSize and the HLE wire flags, written on every ROM load. It was
+   * bring-up instrumentation for the device-only black screen and the Mario
+   * Kart BSOD, both of which are closed, and it wrote a file to the card on
+   * every single launch to say so. Removed; git history has it if a device-
+   * only load fault ever needs it again (git log -S snes_diag.txt). */
+
+  /* (Baseline profile, on device, pre-levers: 312 MHz, budget 5.2M cyc/frame;
+   * interpreter+APU 7.12M, PPU +2.82M, audio 0.71M → ~29 fps raw. Rig insn ≈
+   * device cycle ~1:1.) */
+
+#ifdef SNES_LOAD_DIAG
+  /* Headless 500-frame DWT profile (~11-18 s stall). Gated OFF by default;
+   * build with -DSNES_LOAD_DIAG (the Makefile's SNES_LOAD_DIAG=1 flag wires
+   * it up and swaps in DWT-instrumented apu.c/dsp.c copies that feed the
+   * three g_diag_* buckets below). Post-lever frame-cost PROFILE -- same
+   * DWT probe, now with spin-skip stats AND an APU split (SPC700 vs DSP,
+   * DSP further split into echo FIR vs the rest), so the next lever is
+   * aimed at a measured number, not a guess. Headless, before the
+   * interactive loop, SD idle, wdog kicked.
+   *
+   * The g_diag_* counters are defined in the generated apu.c and incremented
+   * at every spc_runOpcode / dsp_cycle / dsp_handleEcho call site. They are
+   * read ONCE after the 250-frame draw loop and divided by 250 for a per-
+   * frame average; DWT_CYCCNT is reset per frame (preserving the existing
+   * cyc_skip/cyc_draw measurement), and the per-call deltas the
+   * instrumentation accumulates are independent of that reset. */
+  {
+    extern uint32_t SystemCoreClock;
+    extern uint64_t g_diag_spc_cycles, g_diag_dsp_cycles,
+                    g_diag_dsp_echo_cycles;
+    common_emu_enable_dwt_cycles();
+    uint64_t cyc_skip = 0, cyc_draw = 0, cyc_audio = 0;
+
+    for (int i = 0; i < 250; i++) {           /* interpreter+APU only */
+      wdog_refresh();
+      g_ppu_skip_render = true;
+      render_frame_into_active_buffer();
+      common_emu_clear_dwt_cycles();
+      run_frame_events(snes);
+      cyc_skip += common_emu_get_dwt_cycles();
+    }
+    uint64_t spin_v0 = g_spin.ops_virtual, spin_r0 = g_spin.ops_real;
+
+    /* Zero the APU buckets AFTER the skip loop (which also runs the APU) so
+     * the read below captures the draw loop only -- the path the device
+     * actually takes when PPU is on and audio is streaming. */
+    g_diag_spc_cycles = 0;
+    g_diag_dsp_cycles = 0;
+    g_diag_dsp_echo_cycles = 0;
+
+    memset(snes_frame, 0, sizeof(snes_frame));
+    for (int i = 0; i < 250; i++) {           /* + PPU line renderer + audio */
+      wdog_refresh();
+      g_ppu_skip_render = false;
+      render_frame_into_active_buffer();
+      common_emu_clear_dwt_cycles();
+      run_frame_events(snes);
+      cyc_draw += common_emu_get_dwt_cycles();
+
+      common_emu_clear_dwt_cycles();
+      snes_pcm_submit();
+      cyc_audio += common_emu_get_dwt_cycles();
+    }
+    uint64_t vd = g_spin.ops_virtual - spin_v0, rd = g_spin.ops_real - spin_r0;
+
+    /* 250-frame sums -> per-frame averages. skeleton = interpreter+memory
+     * alone (cyc_skip minus the APU work that the skip loop also ran);
+     * PPU = cyc_draw - cyc_skip (the line renderer + mode 7 the skip loop
+     * skipped); DSP non-echo = dsp - echo (the channel mix path a 16 kHz
+     * mono decimation would NOT touch); echo = the FIR filter work it
+     * WOULD halve. audio = snes_pcm_submit (the DMA buffer handoff). */
+    uint64_t skel_pf = cyc_skip / 250 - g_diag_spc_cycles / 250
+                     - g_diag_dsp_cycles / 250;
+    uint64_t ppu_pf  = (cyc_draw - cyc_skip) / 250;
+    uint64_t spc_pf  = g_diag_spc_cycles / 250;
+    uint64_t dsp_pf  = g_diag_dsp_cycles / 250;
+    uint64_t echo_pf = g_diag_dsp_echo_cycles / 250;
+    uint64_t nonecho_pf = dsp_pf - echo_pf;
+    uint64_t audio_pf = cyc_audio / 250;
+    uint64_t total_pf = skel_pf + ppu_pf + spc_pf + dsp_pf + audio_pf;
+
+    FILE *df = fopen("/snes_diag.txt", "a");
+    if (df) {
+      fprintf(df, "SNES profile3: clk=%lu skel=%lu(%lu%%) ppu=%lu(%lu%%) "
+                  "spc=%lu(%lu%%) dsp=%lu(%lu%%) [echo=%lu(%lu%%) non_echo=%lu(%lu%%)] "
+                  "audio=%lu(%lu%%) total=%lu spin=%lu%%(gate=%d) rc=%d "
+                  "hash=%08lX/exp=%08lX\n",
+              (unsigned long)SystemCoreClock,
+              (unsigned long)skel_pf,  (unsigned long)(total_pf ? 100*skel_pf/total_pf : 0),
+              (unsigned long)ppu_pf,   (unsigned long)(total_pf ? 100*ppu_pf/total_pf : 0),
+              (unsigned long)spc_pf,   (unsigned long)(total_pf ? 100*spc_pf/total_pf : 0),
+              (unsigned long)dsp_pf,   (unsigned long)(total_pf ? 100*dsp_pf/total_pf : 0),
+              (unsigned long)echo_pf,  (unsigned long)(dsp_pf ? 100*echo_pf/dsp_pf : 0),
+              (unsigned long)nonecho_pf,(unsigned long)(dsp_pf ? 100*nonecho_pf/dsp_pf : 0),
+              (unsigned long)audio_pf, (unsigned long)(total_pf ? 100*audio_pf/total_pf : 0),
+              (unsigned long)total_pf,
+              (unsigned long)((vd + rd) ? (100 * vd / (vd + rd)) : 0),
+              (int)g_spin.gate_on,
+              (int)g_rc_active,
+              (unsigned long)s_rc_diag_crc, (unsigned long)s_rc_diag_exp);
+      fclose(df);
+    }
+  }
+#endif /* SNES_LOAD_DIAG */
+
+  if (load_state) {
+    odroid_system_emu_load_state(save_slot);
+  } else {
+    lcd_clear_buffers();
+  }
+  memset(snes_frame, 0, sizeof(snes_frame));   /* borders start black and stay black */
+
+#ifdef SNES_DEVICE_PROFILE
+  /* Arm AFTER snes_init()/load_state so the AHB pre-flight sees the Apu's
+   * 66 KB already taken, and after the last boot-time SD write. */
+  snes_profile_init(SNES_AUDIO_RATE, SNES_AUDIO_SAMPLES);
+  uint32_t prof_wall_prev = snes_prof_wall_now();
+  uint32_t prof_dma_prev  = dma_counter;
+#endif
+
+  while (1) {
+#ifdef SNES_DEVICE_PROFILE
+    /* ONE DWT base per iteration. Every SNES_PROF_MARK below is a CUMULATIVE
+     * read from it and nothing in the loop may re-clear CYCCNT — a nested
+     * clear would silently reset the frame's zero point, so
+     * snes_profile_record() checks the marks are monotonic and fails the whole
+     * run if they are not. */
+    uint32_t prof_base       = common_emu_get_dwt_cycles();
+    uint32_t prof_apu_in_emu = 0;
+    uint32_t prof_wall_pace  = 0;
+    uint32_t prof_dma_before = 0;
+    uint32_t prof_wfi        = 0;
+#endif
+    wdog_refresh();
+
+    bool drawFrame = common_emu_frame_loop();
+    SNES_PROF_MARK(SNES_PROF_M_FRAMECTL);
+
+    odroid_input_read_gamepad(&joystick);
+    common_emu_input_loop(&joystick, options, &blit);
+    common_emu_input_loop_handle_turbo(&joystick);
+
+    snes->input1->currentState = read_snes_pad(&joystick);
+    SNES_PROF_MARK(SNES_PROF_M_INPUT);
+
+    snes->disableRender = false;
+    g_ppu_skip_render = !drawFrame;
+    render_frame_into_active_buffer();
+    SNES_PROF_MARK(SNES_PROF_M_RENDER_ARM);
+
+    run_frame_events(snes);
+    SNES_PROF_MARK(SNES_PROF_M_EMU);
+#ifdef SNES_DEVICE_PROFILE
+    /* Split the Ledger B APU accumulator at the emu/pcm boundary: core_rem is
+     * emu_outer minus the APU work that happened INSIDE emu_outer, and the pcm
+     * top-up further down must not be subtracted from it as well. */
+    prof_apu_in_emu = snes_prof_b_apu_cyc;
+#endif
+
+    if (drawFrame)
+      present_frame();
+    SNES_PROF_MARK(SNES_PROF_M_PRESENT_KICK);
+
+    if (!audio_started) {
+      audio_start_playing(SNES_AUDIO_SAMPLES);
+      audio_started = 1;
+      wdog_refresh();
+    }
+    snes_pcm_submit();
+    SNES_PROF_MARK(SNES_PROF_M_PCM);
+
+    if (drawFrame) {
+      present_frame_wait();
+      SNES_PROF_MARK(SNES_PROF_M_PRESENT_TAIL);
+      common_ingame_overlay();
+      SNES_PROF_MARK(SNES_PROF_M_OVERLAY);
+      lcd_swap();
+      SNES_PROF_MARK(SNES_PROF_M_SWAP);
+    }
+#ifdef SNES_DEVICE_PROFILE
+    else {
+      /* Skipped frame: none of the three drawn-only phases ran. Collapse their
+       * marks onto the pcm mark so each delta is exactly 0 -- leaving them at
+       * last frame's values would make the deltas garbage AND break the
+       * monotonicity gate. */
+      snes_prof_mark[SNES_PROF_M_PRESENT_TAIL] =
+      snes_prof_mark[SNES_PROF_M_OVERLAY]      =
+      snes_prof_mark[SNES_PROF_M_SWAP]         = snes_prof_mark[SNES_PROF_M_PCM];
+    }
+    uint32_t prof_pace_w0 = snes_prof_wall_now();
+#endif
+
+    /* Pace the loop by the audio DMA UNCONDITIONALLY (WS pattern,
+     * main_wswan.c:348-366). common_emu_sound_sync skips this wait when
+     * skip_frames>0, which let heavy SNES games run ahead of real time and
+     * play audio at fast-forward speed (SMW 55fps = 92% speed, SM 31fps =
+     * half speed). Waiting for one DMA tick every frame caps the emulator at
+     * real time so the tempo is correct; on frames that genuinely overran,
+     * the DMA has already advanced so this passes through with no delay.
+     *
+     * Catch-up: if the DMA advanced multiple periods during a slow frame,
+     * produce extra audio batches so the next periods have fresh data. Stale
+     * audio from the underrun period itself is irrecoverable, but this
+     * prevents compounding — both half-buffers end up fresh. HLE (SMW)
+     * produces audio cheaply (no SPC700); LLE (Zelda/SM) pays ~0.5ms per
+     * extra batch (one DSP frame of apu_cycle). Port sync for LLE: extra
+     * apu_cycle calls advance SPC700 beyond the CPU frame; SPC700 reads
+     * stale $2140-43 ports — inaudible for music (N-SPC polls ports
+     * periodically, not per-sample). */
+    /* Pace only once SAI is running — otherwise dma_counter never moves and
+     * the 100k-iter guard just burns time (and can still trip WWDG under load). */
+    if (odroid_system_get_app()->speedupEnabled == SPEEDUP_1x) {
+        static uint32_t snes_last_dma = 0;
+        if (snes_last_dma == 0) snes_last_dma = dma_counter;
+#ifdef SNES_DEVICE_PROFILE
+        /* How many audio periods had ALREADY elapsed when we got here. 0 means
+         * we arrived before the deadline and are about to wait; >=1 means the
+         * deadline had already passed, the wait below falls straight through,
+         * and LLE never recovers that period. Reading a near-zero wait as
+         * "we overran" without this number is the mistake the review flagged. */
+        prof_dma_before = dma_counter - snes_last_dma;
+#endif
+        /* Feed the watchdog and give up eventually. This wait blocks until the
+         * audio DMA advances, and it had neither guard: if dma_counter stops
+         * moving the loop spins forever, WWDG fires, and a watchdog reset
+         * leaves no BSOD and no log -- the device simply drops out.
+         *
+         * That is what killed SMW after closing the pause menu. The comment
+         * above is the reason it was SMW-only: a frame that overran finds the
+         * DMA already advanced and passes straight through, so Zelda (35 fps)
+         * and Super Metroid (30 fps) never actually wait here. Only SMW with
+         * the audio HLE is fast enough to arrive before the DMA ticks -- and
+         * if the menu left the DMA stopped, that arrival never ends. Turning
+         * the HLE off "fixed" it by making the emulator too slow to reach the
+         * wait, which is why every other explanation fit some of the evidence
+         * and none of it fit all.
+         *
+         * The bound is generous (~100 ms, several audio periods): a frame that
+         * legitimately waits is far under it, so pacing is unchanged. */
+        {
+            uint32_t spin_guard = 0;
+            while (dma_counter == snes_last_dma && spin_guard < 100000u) {
+                wdog_refresh();
+                cpumon_sleep();
+                spin_guard++;
+            }
+#ifdef SNES_DEVICE_PROFILE
+            prof_wfi = spin_guard;   /* __WFI() round trips actually executed */
+#endif
+        }
+        uint32_t elapsed = dma_counter - snes_last_dma;
+        snes_last_dma = dma_counter;
+        /* LLE catch-up. A frame slower than one 16.625 ms audio period leaves
+         * the periods it ran past playing stale buffer contents -- the comment
+         * below used to call that an accepted underrun, and the device profile
+         * showed it on every single frame (deadline advance 1 on 34, 2 on 30,
+         * 0 on none). Fill those periods too. This does NOT call apu_cycle, so
+         * the SPC700 timer never moves relative to the 65816 and the tempo
+         * objection below does not apply: the samples come from the stretcher,
+         * which is resampling audio the core already produced.
+         * Backlog past a few periods is a pause/load, not a slow frame -- drop
+         * it and resync rather than grind, same rule (and the same watchdog-fed,
+         * bounded wait) the wire path settled on after the SMW-menu death. */
+        if (elapsed > 4) elapsed = 1;
+        while (elapsed > 1) {
+            snes_pcm_emit();
+            uint32_t guard = 0;
+            while (dma_counter == snes_last_dma && guard < 20000u) {
+                wdog_refresh();
+                cpumon_sleep();
+                guard++;
+            }
+            snes_last_dma = dma_counter;
+            elapsed--;
+        }
+        /* Catch-up only for HLE: wire_frame_audio produces samples without
+         * advancing the SPC700, so extra batches are free and tempo stays
+         * exact. For LLE, extra apu_cycle calls would drift the SPC700's
+         * internal timer relative to the CPU, changing music tempo (the
+         * port-sync-drift the user flagged). LLE accepts the underrun
+         * (stale audio for one DMA period on slow frames) rather than
+         * distorting tempo — the WS unconditional wait above already
+         * guarantees correct playback speed. */
+#ifdef SNES_SMW_HLE_PRODUCT
+        if (g_wire_on) {
+            /* Catch-up: replay the audio batches the DMA advanced past on a slow
+             * frame. But `elapsed` is unbounded -- after the pause menu it counts
+             * every audio period spent in the menu, so this tried to regenerate
+             * seconds of audio at once, and the inner DMA wait below had no
+             * watchdog feed or ceiling. That is the real SMW-menu death (Codex
+             * adversarial review of 15dd53c8, which had guarded the wrong wait).
+             *
+             * Backlog past a couple of frames is not worth replaying -- the audio
+             * for time spent paused is gone regardless -- so cap it and resync
+             * rather than grind through it. */
+            if (elapsed > 4) {
+                snes_last_dma = dma_counter;   /* drop the backlog, don't replay it */
+                elapsed = 0;
+            }
+            while (elapsed > 1) {
+                snes_pcm_submit();
+                uint32_t guard = 0;
+                while (dma_counter == snes_last_dma && guard < 20000u) {
+                    wdog_refresh();
+                    cpumon_sleep();
+                    guard++;
+                }
+                snes_last_dma = dma_counter;
+                elapsed--;
+            }
+        }
+#endif
+    }
+#ifdef SNES_DEVICE_PROFILE
+    prof_wall_pace = snes_prof_wall_now() - prof_pace_w0;
+    SNES_PROF_MARK(SNES_PROF_M_PACING);
+    {
+      /* wall_frame is measured end-of-iteration to end-of-iteration, so it
+       * covers the WHOLE period including the previous snes_profile_record()
+       * call. Measuring it from the top of this iteration instead would leave
+       * the recorder's own cost outside every frame, and the sum would then
+       * disagree with the audio-DMA reference for a reason that has nothing to
+       * do with the emulator -- i.e. it would break the wall_vs_dma gate that
+       * exists to catch real problems. */
+      uint32_t wall_now = snes_prof_wall_now();
+      uint32_t dma_now  = dma_counter;
+      snes_profile_record(drawFrame, prof_base, prof_apu_in_emu,
+                          wall_now - prof_wall_prev, prof_wall_pace,
+                          prof_dma_before, dma_now - prof_dma_prev, prof_wfi);
+      prof_wall_prev = wall_now;
+      prof_dma_prev  = dma_now;
+    }
+#endif
+  }
+}

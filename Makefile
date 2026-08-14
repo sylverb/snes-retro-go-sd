@@ -1,118 +1,156 @@
-# Retro-Go SD template — one project = one CORE or one GWHB homebrew.
+# SNES (LakeSnes) — standalone Retro-Go SD dynamic core.
 #
-#   make                  — build + pack (default: PROJECT_KIND=core)
-#   make PROJECT_KIND=homebrew
-#   make docker           — same build inside Docker (no host toolchain)
-#   make docker_shell     — interactive shell in the builder image
+#   make / make docker
 #
-# Customize CORE_NAME / pack metadata below, then replace src/main.c.
-# Verbose compiler lines: make V=
+# Output: snes.bin → /cores/snes.bin ; ROMs under /roms/snes/ (.sfc .smc .fig .swc)
+#
+# Memory (match jshsakura overlay, adapted to this firmware ABI):
+#   ITCM     — Thumb-2 65816 + bus accessors + app_main_snes (same as jsh)
+#   DTCM     — small structs + Apu/ARAM via dtc_* (jsh: structs on DTCM heap,
+#              Apu on AHB; AHB here is ~56 KiB so Apu cannot follow)
+#   AHB      — ~56 KiB newlib heap only
+#   RAM_EMU  — core image + WRAM/VRAM/SRAM/FB/Ppu (ram_* leftover)
 
-#######################################
-# Project identity
-#######################################
-# core     → pack_core.py     → /cores/<name>.bin
-# homebrew → pack_homebrew.py → /homebrews/<name>.bin
 PROJECT_KIND ?= core
 
-CORE_NAME  := example
-CORE_ENTRY := app_main
+CORE_NAME  := snes
+CORE_ENTRY := app_main_snes
+
+OPT ?= -O3
+
+SNES := src/snes
+
+SNES_THUMB2_CPU ?= 1
+SNES_THUMB2_SPC ?= 1
+# Match jshsakura shipping defaults (Makefile.common).
+SNES_SPIN_SKIP ?= 0
+SNES_DSP_MONO ?= 0
+SNES_SPC_IDLE_SKIP ?= 1
+SNES_BUS_IN_ITCM ?= 1
 
 CORE_C_SOURCES := \
-src/main.c
+$(SNES)/apu.c \
+$(SNES)/cart.c \
+$(SNES)/cpu.c \
+$(SNES)/dma.c \
+$(SNES)/dsp.c \
+$(SNES)/dsp1_hle.c \
+$(SNES)/input.c \
+$(SNES)/ppu.c \
+$(SNES)/snes.c \
+$(SNES)/snes_other.c \
+$(SNES)/spc.c \
+$(SNES)/spin_skip.c \
+$(SNES)/rc_dispatch.c \
+$(SNES)/tracing.c \
+src/snes_audio_stretch.c \
+src/main_snes.c
 
-# Relative path so Docker bind-mounts work (do NOT use $(abspath) — it
-# bakes the host path into Make prerequisites / .d files). Do not name
-# this SDK_ROOT: that env var is commonly set by Android SDK installs.
-GNW_CORE_SDK ?= sdk
-# Separate build trees so switching PROJECT_KIND does not reuse stale .o.
-BUILD_DIR ?= build/$(PROJECT_KIND)
+CORE_ASM_SOURCES :=
+ifeq ($(SNES_THUMB2_CPU),1)
+CORE_ASM_SOURCES += $(SNES)/thumb2/snes_thumb2.S
+CORE_C_SOURCES += $(SNES)/thumb2/cpu_thumb2_offsets_check.c
+endif
+ifeq ($(SNES_THUMB2_SPC),1)
+CORE_ASM_SOURCES += $(SNES)/thumb2/spc_thumb2.S
+CORE_C_SOURCES += $(SNES)/thumb2/spc_thumb2_offsets_check.c
+endif
 
-#######################################
-# Kind-specific compile defs + packing
-#######################################
-ifeq ($(PROJECT_KIND),core)
-# Match release-firmware layout of retro_emulator_file_t: COVERFLOW fields
-# sit before cheat_* — CHEAT_CODES alone with COVERFLOW=0 misaligns pointers.
-# MAX_CHEAT_CODES mirrors Makefile.common's release default.
+CORE_C_INCLUDES := \
+-Isrc \
+-I$(SNES)
+
 CORE_C_DEFS := \
 -DPROJECT_KIND_CORE=1 \
 -DCOVERFLOW=1 \
--DCHEAT_CODES=1 \
--DMAX_CHEAT_CODES=13
+-DCHEAT_CODES=0 \
+-DTARGET_GNW \
+-DPPU_RGB565 \
+-DGNW_SNES_CORE \
+-DSNES_PPU_DIRECT_MATH \
+-DSNES_DIRECT_VIDEO \
+-DSNES_PRESENT_DMA2D \
+-DSNES_SPC_IDLE_SKIP=$(SNES_SPC_IDLE_SKIP) \
+-DSNES_PPU_OPAQUE_TILE=1 \
+-DSNES_PPU_BLEND_LUT=1 \
+-DSNES_PPU_VIRGIN_Z=1 \
+-DSNES_SKIP_SPRITE_EVAL_ON_SKIP=1 \
+-DSNES_STRETCH_FOLLOW=1
 
-PACKED_BIN  := $(CORE_NAME).bin
-PAD_LOGO    := src/assets/pad.png
-HEADER_LOGO := src/assets/header.png
-
-else ifeq ($(PROJECT_KIND),homebrew)
-CORE_C_DEFS := \
--DPROJECT_KIND_HOMEBREW=1
-
-PACKED_BIN := ExampleHB.bin
-COVER_JPG  := $(BUILD_DIR)/cover.jpg
-
-else
-$(error PROJECT_KIND must be 'core' or 'homebrew' (got '$(PROJECT_KIND)'))
+ifeq ($(SNES_BUS_IN_ITCM),1)
+CORE_C_DEFS += -DSNES_BUS_IN_ITCM
 endif
+ifeq ($(SNES_SPIN_SKIP),1)
+CORE_C_DEFS += -DSNES_SPIN_SKIP
+endif
+ifeq ($(SNES_DSP_MONO),1)
+CORE_C_DEFS += -DSNES_DSP_MONO
+endif
+ifeq ($(SNES_THUMB2_CPU),1)
+CORE_C_DEFS += -DSNES_THUMB2_CPU
+endif
+ifeq ($(SNES_THUMB2_SPC),1)
+CORE_C_DEFS += -DSPC_THUMB2_SPC
+endif
+
+CORE_LDSCRIPT := snes_core.ld
+CORE_LDLIBS := -lm
+
+GNW_CORE_SDK ?= sdk
+BUILD_DIR ?= build/$(PROJECT_KIND)
 
 include $(GNW_CORE_SDK)/Makefile
 
-PACK_CORE     := $(GNW_CORE_SDK)/tools/pack_core.py
-PACK_HOMEBREW := $(GNW_CORE_SDK)/tools/pack_homebrew.py
+# Quiet noisy upstream warnings.
+$(BUILD_DIR)/apu.o \
+$(BUILD_DIR)/cart.o \
+$(BUILD_DIR)/cpu.o \
+$(BUILD_DIR)/dma.o \
+$(BUILD_DIR)/dsp.o \
+$(BUILD_DIR)/dsp1_hle.o \
+$(BUILD_DIR)/input.o \
+$(BUILD_DIR)/ppu.o \
+$(BUILD_DIR)/snes.o \
+$(BUILD_DIR)/snes_other.o \
+$(BUILD_DIR)/spc.o \
+$(BUILD_DIR)/spin_skip.o \
+$(BUILD_DIR)/rc_dispatch.o \
+$(BUILD_DIR)/tracing.o \
+$(BUILD_DIR)/snes_audio_stretch.o \
+$(BUILD_DIR)/main_snes.o: CFLAGS += \
+	-Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-function \
+	-Wno-unused-parameter -Wno-sign-compare -Wno-strict-aliasing \
+	-Wno-implicit-fallthrough -Wno-parentheses -Wno-maybe-uninitialized \
+	-Wno-type-limits
 
-#######################################
-# Pack
-#######################################
-.PHONY: pack cover
+PACKED_BIN := snes.bin
+PACK_CORE  := $(GNW_CORE_SDK)/tools/pack_core.py
+PAD_LOGO_C    := src/assets/snes_logos.c:pad_snes
+HEADER_LOGO_C := src/assets/snes_logos.c:header_snes
 
-ifeq ($(PROJECT_KIND),core)
-
-pack: $(TARGET_BIN) $(PAD_LOGO) $(HEADER_LOGO)
+.PHONY: pack
+pack: $(TARGET_BIN)
 	$(V)$(ECHO) [ PACK CORE ] $(PACKED_BIN)
 	$(V)python3 $(PACK_CORE) \
 		--elf $(TARGET_ELF) --bin $(TARGET_BIN) \
-		--system-name "Example Core" --dirname example \
-		--extensions "bin" \
-		--core-name "Example" \
+		--system-name "SNES" --dirname snes \
+		--extensions "sfc smc fig swc" \
+		--core-name "lakesnes" \
 		--version 1.0.0 \
-		--cheat-ext ggcodes \
-		--pad-logo $(PAD_LOGO) \
-		--header-logo $(HEADER_LOGO) \
+		--pad-logo-c $(PAD_LOGO_C) \
+		--header-logo-c $(HEADER_LOGO_C) \
 		--out $(PACKED_BIN)
-
-else
-
-.PHONY: cover
-cover: $(COVER_JPG)
-
-# Must fit gui.c COVER_MAX_WIDTH x COVER_MAX_HEIGHT (186x100) and
-# COVER_SIZE (10 KiB) — oversized covers smash the HW JPEG scratch.
-$(COVER_JPG):
-	@mkdir -p $(BUILD_DIR)
-	python3 -c "from pathlib import Path; from PIL import Image, ImageDraw, ImageFont; \
-img=Image.new('RGB', (186,100), (32,48,96)); \
-d=ImageDraw.Draw(img); \
-d.rectangle((8,8,177,91), outline=(220,220,255), width=2); \
-d.text((20,38), 'Example HB', fill=(255,255,255)); \
-img.save('$(COVER_JPG)', 'JPEG', quality=85, optimize=True); \
-sz=Path('$(COVER_JPG)').stat().st_size; \
-assert sz <= 10*1024, f'cover too big: {sz}'"
-
-pack: $(TARGET_BIN) $(COVER_JPG)
-	$(V)$(ECHO) [ PACK GWHB ] $(PACKED_BIN)
-	$(V)python3 $(PACK_HOMEBREW) \
-		--elf $(TARGET_ELF) --bin $(TARGET_BIN) \
-		--name "Example Homebrew" --version 1.0.0 \
-		--cover $(COVER_JPG) \
-		--out $(PACKED_BIN)
-
-endif
 
 all: pack
 
-# Read-only helpers for CI / scripts (make print-PROJECT_KIND, etc.).
-.PHONY: print-PROJECT_KIND print-PACKED_BIN print-CORE_NAME print-DOCKER_IMAGE
+clean::
+	$(V)rm -f $(PACKED_BIN)
+
+#######################################
+# Docker
+#######################################
+.PHONY: docker docker_pull docker_shell print-PROJECT_KIND print-PACKED_BIN print-CORE_NAME print-DOCKER_IMAGE
+
 print-PROJECT_KIND:
 	@echo $(PROJECT_KIND)
 print-PACKED_BIN:
@@ -122,23 +160,11 @@ print-CORE_NAME:
 print-DOCKER_IMAGE:
 	@echo $(DOCKER_IMAGE)
 
-clean::
-	$(V)rm -f $(PACKED_BIN)
-ifeq ($(PROJECT_KIND),homebrew)
-	$(V)rm -f $(COVER_JPG)
-endif
-
-#######################################
-# Docker (same image as firmware repo)
-#######################################
-.PHONY: docker docker_pull docker_shell
-
 RELEASE_VERSION ?= v1.5
 DOCKER_REPOSITORY ?= sylverb/retro-go-sd-builder
 DOCKER_IMAGE ?= $(DOCKER_REPOSITORY):$(RELEASE_VERSION)
 
 DOCKER_TTY_FLAG := $(shell if [ -t 0 ]; then echo -it; else echo; fi)
-# Host UID so build/ artifacts are not root-owned on the bind mount.
 DOCKER_USER := $(shell id -u):$(shell id -g)
 DOCKER_RUN := docker run --rm $(DOCKER_TTY_FLAG) \
 	--user $(DOCKER_USER) \
@@ -146,16 +172,13 @@ DOCKER_RUN := docker run --rm $(DOCKER_TTY_FLAG) \
 	-w /opt/workdir \
 	$(DOCKER_IMAGE)
 
-# Compile inside the published builder image (uses the local copy).
-# Refresh with `make docker_pull` when you want a newer digest for the tag.
 docker:
-	$(V)$(ECHO) "[ DOCKER ]" $(DOCKER_IMAGE) "PROJECT_KIND=$(PROJECT_KIND)"
-	$(V)$(DOCKER_RUN) make --no-print-directory -j$$(nproc) PROJECT_KIND=$(PROJECT_KIND)
+	$(V)$(ECHO) "[ DOCKER ]" $(DOCKER_IMAGE)
+	$(V)$(DOCKER_RUN) make --no-print-directory -j$$(nproc)
 
 docker_pull:
 	$(V)$(ECHO) "[ PULL ]" $(DOCKER_IMAGE)
 	$(V)docker pull $(DOCKER_IMAGE)
 
-# Interactive shell with the same image / mount as `make docker`.
 docker_shell:
 	$(DOCKER_RUN) bash
