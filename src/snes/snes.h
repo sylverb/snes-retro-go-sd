@@ -18,6 +18,42 @@ typedef struct Snes Snes;
 #include "input.h"
 #include "saveload.h"
 
+/* A LoROM DSP-1 board decodes the chip at banks $30-$3f (mirrored at $b0-$bf),
+ * $8000-$ffff. snes_cpuRead's ROM fast path and its fetch-page cache claim
+ * everything at $8000 and above, so that window has to come out of them.
+ * SNES_DSP_FASTPATH=1 takes it out with one test at page-install time. */
+#ifndef SNES_DSP_FASTPATH
+#define SNES_DSP_FASTPATH 1
+#endif
+#ifndef SNES_LINE_HIRQ
+#define SNES_LINE_HIRQ 1
+#endif
+/* Fetch-page cache for carts whose size is not a power of two (3 MB, etc.). */
+#ifndef SNES_ROMPAGE_FOLD
+#define SNES_ROMPAGE_FOLD 1
+#endif
+#if SNES_ROMPAGE_FOLD
+#define SNES_ROM_PAGE_OK(cart) ((cart)->romPageOk)
+#else
+#define SNES_ROM_PAGE_OK(cart) ((cart)->romMask)
+#endif
+/* OFF: serving ROM below $8000 from ITCM costs LoROM carts that never collect.
+ * =2 would put the same serve in snes_read(); still taxes uncacheable dumps. */
+#ifndef SNES_ROMPAGE_LOW
+#define SNES_ROMPAGE_LOW 0
+#endif
+#if SNES_ROMPAGE_LOW == 1 && SNES_ROMPAGE_FOLD
+#define SNES_BANK_LOW_ROM(cart, bank) ((cart)->bankLowRom[(bank)])
+#else
+#define SNES_BANK_LOW_ROM(cart, bank) 0
+#endif
+#if SNES_DSP_FASTPATH
+#define SNES_DSP_LOROM_WINDOW(cart, bank) \
+  ((cart)->dsp1 && (cart)->type == 1 && (uint8_t)(((bank) & 0x7f) - 0x30) < 0x10u)
+#else
+#define SNES_DSP_LOROM_WINDOW(cart, bank) 0
+#endif
+
 struct Snes {
   Cpu* cpu;
   Apu* apu;

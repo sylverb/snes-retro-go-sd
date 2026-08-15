@@ -73,7 +73,11 @@ static void snes_wait_button(void)
 #include "snes/input.h"
 #include "snes/saveload.h"
 #include "snes/spin_skip.h"
+#ifdef SNES_SPIN_BAKE
+#include "snes/spin_bake.h"
+#endif
 #include "snes_audio_stretch.h"
+#include "snes_dsp_variant.h"
 #include "snes/rc_dispatch.h"
 #include "snes_profile.h"
 
@@ -218,6 +222,11 @@ static void SNES_ITCM_SCHED cpu_tick(Snes *s) {
 
 static void SNES_ITCM_SCHED run_dots(Snes *s, int dots) {
   Cpu *cpu = s->cpu;
+#ifdef SNES_SPIN_BAKE
+  /* One test per SPAN, outside the loop below. See spin_bake.h. */
+  if ((uint16_t)(s->cpu->pc - g_bake.pc_load) <= 2u)
+    dots = spin_bake_run_span(s, s->cpu, dots);
+#endif
   bool dma_active = s->dma->dmaBusy || s->dma->hdmaTimer > 0;
   while (dots > 0) {
     if (dma_active) {
@@ -280,6 +289,9 @@ static void SNES_ITCM_SCHED run_frame_events(Snes *s) {
   wdog_refresh();
   snes_catchupApu(s);
   spin_frame_tick();   /* auto-gate: park the learner on non-spinning carts */
+#ifdef SNES_SPIN_BAKE
+  spin_bake_frame_tick();
+#endif
 #ifdef SNES_SMW_HLE_PRODUCT
   wire_try_swap(s, smw_hle_frame++);
 #endif
@@ -469,12 +481,32 @@ static void blit(void) {
 static bool snes_half_render = true;
 static uint8_t snes_half_ctr;
 static char snes_half_value[2];
+/* Physical G&W pad → SNES port 1 (0) or port 2 (1). MMX2's Cx4 self-test
+ * and a few 2P titles read port 2. */
+static int snes_pad_port;
+static char snes_pad_value[2];
 
 static const gw_i18n_entry_t i18n_half_render[] = {
   { "en", "Half-rate render" },
   { "fr", "Rendu 1 image / 2" },
   { "es", "Render 1 de cada 2" },
   { "de", "Jedes 2. Bild" },
+  GW_I18N_END
+};
+
+static const gw_i18n_entry_t i18n_pad_port[] = {
+  { "en", "Controller" },
+  { "fr", "Manette" },
+  { "es", "Mando" },
+  { "de", "Controller" },
+  GW_I18N_END
+};
+
+static const gw_i18n_entry_t i18n_reset[] = {
+  { "en", "Reset" },
+  { "fr", "Réinitialiser" },
+  { "es", "Reiniciar" },
+  { "de", "Zurücksetzen" },
   GW_I18N_END
 };
 
@@ -511,6 +543,18 @@ static bool snes_half_render_cb(odroid_dialog_choice_t *option,
   return event == ODROID_DIALOG_ENTER;
 }
 
+static bool snes_pad_port_cb(odroid_dialog_choice_t *option,
+                            odroid_dialog_event_t event, uint32_t repeat)
+{
+  (void)repeat;
+  if (event == ODROID_DIALOG_PREV || event == ODROID_DIALOG_NEXT) {
+    snes_pad_port = snes_pad_port ? 0 : 1;
+    odroid_settings_app_int32_set("PadPort", snes_pad_port);
+  }
+  strcpy(option->value, snes_pad_port ? "2" : "1");
+  return event == ODROID_DIALOG_ENTER;
+}
+
 /* ---- audio ----------------------------------------------------------------
  * Top the DSP up to one frame of samples (534 stereo pairs internally) and
  * downmix to 16 kHz mono, exactly like the harness/rig.
@@ -526,6 +570,23 @@ _Static_assert((SNES_PCM_RING & (SNES_PCM_RING - 1u)) == 0u,
 static int16_t snes_pcm_ring[SNES_PCM_RING];
 static volatile uint16_t snes_pcm_head;
 static volatile uint16_t snes_pcm_tail;
+
+static bool snes_reset_cb(odroid_dialog_choice_t *option,
+                         odroid_dialog_event_t event, uint32_t repeat)
+{
+  (void)option;
+  (void)repeat;
+  if (event == ODROID_DIALOG_ENTER && snes) {
+    wdog_refresh();
+    snes_reset(snes, true);
+    snes_stretch_reset();
+    snes_pcm_head = 0;
+    snes_pcm_tail = 0;
+    snes_half_ctr = 0;
+    wdog_refresh();
+  }
+  return event == ODROID_DIALOG_ENTER;
+}
 
 static void snes_pcm_pump(void)
 {
@@ -784,10 +845,8 @@ static uint32_t snes_rom_len;
 
 /* $ffd6 (ROM type): 0=ROM 1=ROM+RAM 2=ROM+RAM+battery; 3+ = coprocessor
  * (DSP-x/SA-1/SuperFX/...). The DSP-1 family (high nibble 0, low nibble 3-5)
- * has HLE support in dsp1_hle.c — those are allowed through. Every other
- * coprocessor (SuperFX/SA-1/Cx4/S-DD1/...) is still rejected. Find the header
- * the same way the loader scores it: the offset whose checksum ^ complement is
- * 0xFFFF wins; if neither validates, let snes_loadRom decide. */
+ * has HLE support in dsp1_hle.c, and Cx4 (romType $F0-$FF with $FFBF=$10)
+ * in cx4_hle.c. Everything else is rejected. */
 static bool cart_needs_coprocessor(const uint8_t *rom, uint32_t len) {
   static const uint32_t offs[2] = { 0x7fb0, 0xffb0 };   /* LoROM, HiROM */
   for (int i = 0; i < 2; i++) {
@@ -797,10 +856,29 @@ static bool cart_needs_coprocessor(const uint8_t *rom, uint32_t len) {
     uint16_t icks = h[0x2c] | (h[0x2d] << 8);
     if ((cks ^ icks) == 0xffff) {
       uint8_t romType = h[0x26];   /* $ffd6 = header+0x26 */
-      /* high nibble 0 = DSP family (HLE in dsp1_hle.c); anything else with
-       * romType >= 3 is a coprocessor we don't support yet */
-      if (romType >= 0x03 && (romType >> 4) != 0)
-        return true;
+      /* high nibble 0 = DSP family (HLE in dsp1_hle.c).
+       * romType 0xF0-0xFF with exCoprocessor 0x10 = Cx4 (HLE in cx4_hle.c).
+       * anything else with romType >= 3 is a coprocessor we don't support yet */
+      if (romType >= 0x03 && (romType >> 4) != 0) {
+        if ((romType >> 4) == 0x0F && h[0x0f] == 0x10) {
+          /* Cx4 is supported */
+        } else {
+          return true;
+        }
+      }
+
+      /* The DSP family is four chips behind one encoding; only DSP-1 is HLE'd.
+       * See snes_dsp_variant.h. Cx4 is high nibble $F — skip this title check. */
+      if (romType >= 0x03 && (romType >> 4) == 0) {
+        char name[22];
+        for (int c = 0; c < 21; c++) {
+          uint8_t ch = h[c];
+          name[c] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '.';
+        }
+        name[21] = 0;
+        if (snes_title_needs_unsupported_dsp(name))
+          return true;
+      }
     }
   }
   return false;
@@ -938,6 +1016,8 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
   odroid_gamepad_state_t joystick;
   odroid_dialog_choice_t options[] = {
       {100, gw_i18n(i18n_half_render), snes_half_value, 1, &snes_half_render_cb},
+      {101, gw_i18n(i18n_pad_port), snes_pad_value, 1, &snes_pad_port_cb},
+      {102, gw_i18n(i18n_reset), NULL, 1, &snes_reset_cb},
       ODROID_DIALOG_CHOICE_LAST
   };
 
@@ -952,6 +1032,7 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 
   odroid_system_init(APPID_SNES, SNES_AUDIO_RATE);
   snes_half_render = odroid_settings_app_int32_get("HalfRender", 1) != 0;
+  snes_pad_port = odroid_settings_app_int32_get("PadPort", 0) != 0 ? 1 : 0;
   snes_apply_frame_time();
 #ifdef SNES_SMW_HLE_PRODUCT
   odroid_system_emu_init(&snes_LoadState, &snes_SaveState, &snes_Screenshot,
@@ -1067,6 +1148,11 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     odroid_system_switch_app(0);
     return;
   }
+#ifdef SNES_SPIN_BAKE
+  spin_bake_scan(snes);
+  printf("snes: bake on=%d sites=%lu pc=%02x:%04x dp=$%02x\n", (int)g_bake.on,
+         (unsigned long)g_bake.sites, g_bake.bank, g_bake.pc_load, g_bake.dp_off);
+#endif
   snes_fps = snes->pal ? SNES_FPS_PAL : SNES_FPS_NTSC;
   snes_audio_samples = SNES_AUDIO_RATE / snes_fps;
   snes_apply_frame_time();
@@ -1244,7 +1330,14 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     common_emu_input_loop(&joystick, options, &blit);
     common_emu_input_loop_handle_turbo(&joystick);
 
-    snes->input1->currentState = read_snes_pad(&joystick);
+    uint16_t pad = read_snes_pad(&joystick);
+    if (snes_pad_port) {
+      snes->input1->currentState = 0;
+      snes->input2->currentState = pad;
+    } else {
+      snes->input1->currentState = pad;
+      snes->input2->currentState = 0;
+    }
     SNES_PROF_MARK(SNES_PROF_M_INPUT);
 
     snes->disableRender = false;

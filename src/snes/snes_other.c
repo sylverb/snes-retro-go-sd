@@ -92,6 +92,11 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
   if(headers[used].coprocessor == 0 && headers[used].chips >= 3 && headers[used].chips <= 5) {
     cart_attachDsp1(snes->cart);
   }
+  // high nibble $f + $ffbf == $10 = Cx4 (Rockman X2/X3 class). Same test as
+  // the host #else path below.
+  if(headers[used].coprocessor == 15 && headers[used].exCoprocessor == 16) {
+    cart_attachCx4(snes->cart);
+  }
   snes_reset(snes, true); // reset after loading
   snes_set_region(snes, headers[used].pal);
   return true;
@@ -124,6 +129,9 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
   // titles share this encoding and will log unknown commands rather than hang.
   if(headers[used].coprocessor == 0 && headers[used].chips >= 3 && headers[used].chips <= 5) {
     cart_attachDsp1(snes->cart);
+  }
+  if(headers[used].coprocessor == 15 && headers[used].exCoprocessor == 16) {
+    cart_attachCx4(snes->cart);
   }
   snes_reset(snes, true); // reset after loading
   snes_set_region(snes, headers[used].pal);

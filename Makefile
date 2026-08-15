@@ -24,6 +24,7 @@ SNES_THUMB2_CPU ?= 1
 SNES_THUMB2_SPC ?= 1
 # Match jshsakura shipping defaults (Makefile.common).
 SNES_SPIN_SKIP ?= 0
+SNES_SPIN_BAKE ?= 1
 SNES_DSP_MONO ?= 0
 SNES_SPC_IDLE_SKIP ?= 1
 SNES_BUS_IN_ITCM ?= 1
@@ -35,12 +36,14 @@ $(SNES)/cpu.c \
 $(SNES)/dma.c \
 $(SNES)/dsp.c \
 $(SNES)/dsp1_hle.c \
+$(SNES)/cx4_hle.c \
 $(SNES)/input.c \
 $(SNES)/ppu.c \
 $(SNES)/snes.c \
 $(SNES)/snes_other.c \
 $(SNES)/spc.c \
 $(SNES)/spin_skip.c \
+$(SNES)/spin_bake.c \
 $(SNES)/rc_dispatch.c \
 $(SNES)/tracing.c \
 src/snes_audio_stretch.c \
@@ -83,6 +86,9 @@ endif
 ifeq ($(SNES_SPIN_SKIP),1)
 CORE_C_DEFS += -DSNES_SPIN_SKIP
 endif
+ifeq ($(SNES_SPIN_BAKE),1)
+CORE_C_DEFS += -DSNES_SPIN_BAKE
+endif
 ifeq ($(SNES_DSP_MONO),1)
 CORE_C_DEFS += -DSNES_DSP_MONO
 endif
@@ -108,12 +114,14 @@ $(BUILD_DIR)/cpu.o \
 $(BUILD_DIR)/dma.o \
 $(BUILD_DIR)/dsp.o \
 $(BUILD_DIR)/dsp1_hle.o \
+$(BUILD_DIR)/cx4_hle.o \
 $(BUILD_DIR)/input.o \
 $(BUILD_DIR)/ppu.o \
 $(BUILD_DIR)/snes.o \
 $(BUILD_DIR)/snes_other.o \
 $(BUILD_DIR)/spc.o \
 $(BUILD_DIR)/spin_skip.o \
+$(BUILD_DIR)/spin_bake.o \
 $(BUILD_DIR)/rc_dispatch.o \
 $(BUILD_DIR)/tracing.o \
 $(BUILD_DIR)/snes_audio_stretch.o \

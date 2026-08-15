@@ -7,6 +7,7 @@
 #include "cart.h"
 #include "snes.h"
 #include "dsp1_hle.h"
+#include "cx4_hle.h"
 #include "snes_gnw_alloc.h"
 
 /* Weak fallbacks so build scripts that list snes/*.c files explicitly and
@@ -23,6 +24,15 @@ __attribute__((weak)) uint8_t dsp1_readSR(Dsp1* d) { (void)d; return 0; }
  * allocates for real. */
 __attribute__((weak)) Dsp1* dsp1_alloc(void) { return NULL; }
 __attribute__((weak)) uint32_t dsp1_size(void) { return 0; }
+
+__attribute__((weak)) void cx4_init(Cx4* c) { (void)c; }
+__attribute__((weak)) uint8_t cx4_read(Cx4* c, uint16_t a) { (void)c; (void)a; return 0; }
+__attribute__((weak)) void cx4_write(Cx4* c, uint16_t a, uint8_t v,
+                                    const uint8_t* rom, uint32_t rom_size) {
+  (void)c; (void)a; (void)v; (void)rom; (void)rom_size;
+}
+__attribute__((weak)) Cx4* cx4_alloc(void) { return NULL; }
+__attribute__((weak)) uint32_t cx4_size(void) { return 0; }
 
 #ifdef GNW_SNES_CORE
 #include <assert.h>
@@ -58,9 +68,50 @@ static inline uint32_t cart_romIndex(Cart* cart, uint32_t addr) {
   return cart_fold(addr, (uint32_t)cart->romSize);
 }
 
+/* snes_cpuRead's fetch-page cache used to require cart->romMask -- a
+ * power-of-two ROM. "Every other size" is not exotic: Super Metroid is 3 MB.
+ * cart_romIndex() already folds those; bake each bank's host base once. */
+static void cart_buildBankLowRom(Cart* cart) {
+  for(int raw = 0; raw < 256; raw++) {
+    uint8_t b7 = (uint8_t)(raw & 0x7f);
+    uint8_t ok = 0;
+    if(raw != 0x7e && raw != 0x7f) {
+      if(cart->type == 1) {
+        int isSram = (((raw >= 0x70 && raw < 0x7e) || raw >= 0xf0) &&
+                      cart->ramSize > 0);
+        ok = (!isSram && b7 >= 0x40) ? 1 : 0;
+      } else if(cart->type == 2) {
+        ok = (b7 >= 0x40) ? 1 : 0;
+      }
+    }
+    cart->bankLowRom[raw] = cart->romPageOk ? ok : 0;
+  }
+}
+
+static void cart_buildBankBases(Cart* cart) {
+  for(int b = 0; b < 128; b++) cart->bankBase[b] = cart->rom;
+  if(cart->romPageOk) {
+    if(cart->type == 1) {
+      for(int b = 0; b < 128; b++)
+        cart->bankBase[b] = cart->rom + cart_romIndex(cart, (uint32_t)b << 15);
+    } else {
+      for(int b = 0; b < 64; b++)
+        cart->bankBase[b] = cart->rom + cart_romIndex(cart, (uint32_t)b << 16);
+    }
+  }
+  cart_buildBankLowRom(cart);
+}
+
 void cart_setRomSize(Cart* cart, int size) {
   cart->romSize = size;
   cart->romMask = (size > 0 && (size & (size - 1)) == 0) ? (uint32_t)(size - 1) : 0;
+  /* A HiROM bank is 64 KB and a LoROM bank is 32 KB. Demanding 64 KB of both
+   * took the cache away from a 32 KB LoROM cart that HAD one via romMask. */
+  const uint32_t bankGran = (cart->type == 2) ? 0xffffu : 0x7fffu;
+  cart->romPageOk = (cart->rom != NULL && size > 0 &&
+                     ((uint32_t)size & bankGran) == 0 &&
+                     (cart->type == 1 || cart->type == 2)) ? 1 : 0;
+  cart_buildBankBases(cart);
 }
 
 static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr);
@@ -79,6 +130,10 @@ Cart* cart_init(Snes* snes) {
   cart->ram = NULL;
   cart->ramSize = 0;
   cart->dsp1 = NULL;
+  cart->cx4 = NULL;
+  cart->romPageOk = 0;
+  memset(cart->bankLowRom, 0, sizeof(cart->bankLowRom));
+  for(int b = 0; b < 128; b++) cart->bankBase[b] = NULL;
   return cart;
 }
 
@@ -87,11 +142,28 @@ void cart_attachDsp1(Cart* cart) {
   if (cart->dsp1) {
     dsp1_reset(cart->dsp1);
     /* LoROM boards decode the DSP at banks $30-$3f, $8000-$ffff — inside the
-     * range snes_cpuRead's ROM fast path would otherwise claim. Dropping the
-     * power-of-2 mask sends this cart down the slow path where our branch
-     * runs; every other cart keeps the fast path untouched. */
+     * range snes_cpuRead's ROM fast path claims. snes_cpuRead excludes the
+     * window at page-install time; SNES_DSP_FASTPATH=0 restores the old
+     * "clear romMask for the whole cart" behaviour. */
+#if !SNES_DSP_FASTPATH
     if (cart->type == 1) cart->romMask = 0;
+#endif
   }
+}
+
+void cart_attachCx4(Cart* cart) {
+  if (cart->cx4 == NULL) cart->cx4 = cx4_alloc();
+  if (cart->cx4) {
+    cx4_init(cart->cx4);
+#ifdef GNW_SNES_CORE
+    printf("snes: Cx4 HLE attached (map=%s, %d KB ROM)\n",
+           cart->type == 1 ? "LoROM" : "HiROM",
+           (int)(cart->romSize / 1024));
+#endif
+  }
+#ifdef GNW_SNES_CORE
+  else printf("snes: Cx4 alloc failed\n");
+#endif
 }
 
 void cart_free(Cart* cart) {
@@ -101,14 +173,16 @@ void cart_free(Cart* cart) {
 void cart_reset(Cart* cart) {
   //if(cart->ramSize > 0 && cart->ram != NULL) memset(cart->ram, 0, cart->ramSize); // for now
   if (cart->dsp1) dsp1_reset(cart->dsp1);
+  if (cart->cx4) cx4_init(cart->cx4);
 }
 
 void cart_saveload(Cart *cart, SaveLoadFunc *func, void *ctx) {
   func(ctx, cart->ram, cart->ramSize);
-  /* DSP carts append the chip state (plain data, versioned via its first
+  /* DSP / Cx4 carts append chip state (plain data, versioned via the first
    * field). Normal carts write exactly what they always did, so existing
    * savestates stay byte-compatible. */
   if (cart->dsp1) func(ctx, cart->dsp1, dsp1_size());
+  if (cart->cx4) func(ctx, cart->cx4, cx4_size());
 }
 
 void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
@@ -132,6 +206,8 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
     cart->ram = NULL;
   }
   cart->ramSize = ramSize;
+  /* AFTER ramSize: bankLowRom has to know whether $70-$7d is SRAM. */
+  cart_buildBankBases(cart);
 #else
   if(cart->rom != NULL) free(cart->rom);
   if(cart->ram != NULL) free(cart->ram);
@@ -145,6 +221,7 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
   }
   cart->ramSize = ramSize;
   memcpy(cart->rom, rom, romSize);
+  cart_buildBankBases(cart);   /* AFTER ramSize -- see the device branch above */
 #endif
 }
 
@@ -176,6 +253,10 @@ static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr) {
     return cart->ram[(((bank & 0xf) << 15) | adr) & (cart->ramSize - 1)];
   }
   bank &= 0x7f;
+  /* Cx4 boards are LoROM: ROM at $8000-$FFFF, MMIO at $00-$3F:$6000-$7FFF. */
+  if(cart->cx4 && bank < 0x40 && adr >= 0x6000 && adr < 0x8000) {
+    return cx4_read(cart->cx4, adr);
+  }
   // DSP-1 on LoROM boards: banks 30-3f, DR 8000-bfff / SR c000-ffff
   if(cart->dsp1 && bank >= 0x30 && bank < 0x40 && adr >= 0x8000) {
     return adr < 0xc000 ? dsp1_readDR(cart->dsp1) : dsp1_readSR(cart->dsp1);
@@ -199,18 +280,33 @@ static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr) {
 }
 
 static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
-  if(cart->dsp1 && (bank & 0x7f) >= 0x30 && (bank & 0x7f) < 0x40 && adr >= 0x8000) {
-    if (adr < 0xc000) dsp1_writeDR(cart->dsp1, val);
-    return;
-  }
-  if(((bank >= 0x70 && bank < 0x7e) || bank > 0xf0) && adr < 0x8000 && cart->ramSize > 0) {
+  if(((bank >= 0x70 && bank < 0x7e) || bank >= 0xf0) && adr < 0x8000 && cart->ramSize > 0) {
     // banks 70-7e and f0-ff, adr 0000-7fff
     cart->ram[(((bank & 0xf) << 15) | adr) & (cart->ramSize - 1)] = val;
+    return;
+  }
+  bank &= 0x7f;
+  /* Cx4 on LoROM boards: banks 00-3f, adr 6000-7fff */
+  if(cart->cx4 && bank < 0x40 && adr >= 0x6000 && adr < 0x8000) {
+    cx4_write(cart->cx4, adr, val, cart->rom, cart->romSize);
+    return;
+  }
+  // DSP-1 on LoROM boards: banks 30-3f, adr 8000-ffff
+  if(cart->dsp1 && bank >= 0x30 && bank < 0x40 && adr >= 0x8000) {
+    if (adr < 0xc000) dsp1_writeDR(cart->dsp1, val);
   }
 }
 
 static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr) {
   bank &= 0x7f;
+  /* Cx4 owns $00-$3F/$80-$BF:$6000-$7FFF. Battery SRAM on those boards is
+   * LoROM-style at $70-$77:$0000-$7FFF. */
+  if(cart->cx4 && bank < 0x40 && adr >= 0x6000 && adr < 0x8000) {
+    return cx4_read(cart->cx4, adr);
+  }
+  if(cart->cx4 && cart->ramSize > 0 && bank >= 0x70 && bank < 0x78 && adr < 0x8000) {
+    return cart->ram[(((bank & 7) << 15) | adr) & (cart->ramSize - 1)];
+  }
   // DSP-1 on HiROM boards: banks 00-1f, DR 6000-6fff / SR 7000-7fff.
   // SRAM decode moves up to banks 20-3f (matching real HiROM+DSP boards).
   if(cart->dsp1 && bank < 0x20 && adr >= 0x6000 && adr < 0x8000) {
@@ -239,6 +335,14 @@ static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr) {
 
 static void cart_writeHirom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
   bank &= 0x7f;
+  if(cart->cx4 && bank < 0x40 && adr >= 0x6000 && adr < 0x8000) {
+    cx4_write(cart->cx4, adr, val, cart->rom, cart->romSize);
+    return;
+  }
+  if(cart->cx4 && cart->ramSize > 0 && bank >= 0x70 && bank < 0x78 && adr < 0x8000) {
+    cart->ram[(((bank & 7) << 15) | adr) & (cart->ramSize - 1)] = val;
+    return;
+  }
   if(cart->dsp1 && bank < 0x20 && adr >= 0x6000 && adr < 0x8000) {
     if (adr < 0x7000) dsp1_writeDR(cart->dsp1, val);
     return;

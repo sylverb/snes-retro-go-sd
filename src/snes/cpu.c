@@ -118,7 +118,7 @@ static void cpu_write(Cpu* cpu, uint32_t adr, uint8_t val) {
 __attribute__((section(".itcm_snes_interp.thumb2.bus")))
 #endif
 uint8_t cpu_thumb2_read(Cpu* cpu, uint32_t adr) {
-#ifdef SNES_SPIN_SKIP
+#if defined(SNES_SPIN_SKIP) && !SNES_SPIN_NO_BUS_HOOKS
   if(g_spin.phase) spin_hook_read(cpu, adr);
 #endif
   return snes_cpuRead((Snes*) cpu->mem, adr);
@@ -128,7 +128,7 @@ uint8_t cpu_thumb2_read(Cpu* cpu, uint32_t adr) {
 __attribute__((section(".itcm_snes_interp.thumb2.bus")))
 #endif
 void cpu_thumb2_write(Cpu* cpu, uint32_t adr, uint8_t val) {
-#ifdef SNES_SPIN_SKIP
+#if defined(SNES_SPIN_SKIP) && !SNES_SPIN_NO_BUS_HOOKS
   if(g_spin.phase) spin_hook_write();
 #endif
   snes_cpuWrite((Snes*) cpu->mem, adr, val);
@@ -176,6 +176,9 @@ void cpu_saveload(Cpu *cpu, SaveLoadFunc *func, void *ctx) {
   cpu->spBreakpoint = 0x0;
 }
 
+#ifndef SNES_SPIN_NO_BUS_HOOKS
+#define SNES_SPIN_NO_BUS_HOOKS 0
+#endif
 /* SNES_THUMB2_CPU: split the interpreter into an oracle symbol the Thumb-2
  * dispatcher can call as a fallback, while keeping flag-off byte-identical to
  * upstream (the macro collapses to the plain name, so the definition token and

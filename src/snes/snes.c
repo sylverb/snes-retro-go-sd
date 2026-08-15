@@ -250,7 +250,13 @@ void snes_handle_pos_stuff(Snes *snes) {
  * V-timer — so take the dot loop only when one is actually armed. The events,
  * their order, and the state they leave behind are identical either way. */
 void snes_run_line(Snes *snes) {
+#if defined(GNW_SNES_CORE) || !SNES_LINE_HIRQ
   if (snes->hIrqEnabled || snes->hPos != 0) {
+#else
+  /* Native SM/Zelda ports: snes_handle_pos_stuff's H-timer is #ifdef
+   * GNW_SNES_CORE, so the dot loop cannot raise that IRQ. Split at hPos==0. */
+  if (snes->hPos != 0) {
+#endif
     do { snes_handle_pos_stuff(snes); } while (snes->hPos != 0);
     return;
   }
@@ -569,6 +575,14 @@ uint8_t snes_read(Snes* snes, uint32_t adr) {
       return dma_read(snes->dma, adr); // dma registers
     }
   }
+#if SNES_ROMPAGE_LOW == 2
+  {
+    Cart* c = snes->cart;
+    if(c->bankLowRom[bank])
+      return (c->type == 1) ? c->bankBase[bank & 0x7f][adr & 0x7fff]
+                            : c->bankBase[bank & 0x3f][adr];
+  }
+#endif
   // read from cart
   return cart_read(snes->cart, bank, adr);
 }
@@ -669,6 +683,18 @@ uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
 #ifdef RIG_CALL_PROFILE
     g_cpuRead_romhit++;
 #endif
+#ifdef SNES_ROMPAGE_VERIFY
+    {
+      uint8_t want = snes_read(snes, adr);
+      uint8_t got  = snes->romPageBase[adr & 0x1fff];
+      if (want != got) {
+        static int nh = 0;
+        if (nh++ < 40)
+          printf("ROMPAGE HIT MISMATCH adr=%06lx fast=%02x slow=%02x tag=%06lx\n",
+                 (unsigned long)adr, got, want, (unsigned long)snes->romPageTag);
+      }
+    }
+#endif
     return snes->romPageBase[adr & 0x1fff];
   }
   uint8_t bank = adr >> 16;
@@ -690,18 +716,63 @@ uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
    * index differs. Power-of-2 ROMs (romMask set = the common case) index with one
    * AND; odd sizes fall to the folding slow path. */
   Cart* cart = snes->cart;
-  if(off >= 0x8000 && cart->romMask) {
+  if(off >= 0x8000 && SNES_ROM_PAGE_OK(cart) && !SNES_DSP_LOROM_WINDOW(cart, bank)) {
     uint32_t page = adr & ~(uint32_t)0x1fff;
+#if SNES_ROMPAGE_FOLD
+    uint8_t* base = (cart->type == 1)
+      ? cart->bankBase[bank & 0x7f] + (page & 0x7fff)
+      : cart->bankBase[bank & 0x3f] + (page & 0xffff);
+#else
     uint32_t pidx = (cart->type == 1)
       ? (((uint32_t)((page >> 16) & 0x7f) << 15) | (page & 0x7fff))  /* LoROM */
       : (((uint32_t)((page >> 16) & 0x3f) << 16) | (page & 0xffff)); /* HiROM */
-    snes->romPageBase = cart->rom + (pidx & cart->romMask);
+    uint8_t* base = cart->rom + (pidx & cart->romMask);
+#endif
+    snes->romPageBase = base;
     snes->romPageTag = page;
 #ifdef RIG_CALL_PROFILE
     g_cpuRead_romhit++;
 #endif
-    return snes->romPageBase[adr & 0x1fff];
+#ifdef SNES_ROMPAGE_VERIFY
+    {
+      uint8_t want = snes_read(snes, adr);
+      uint8_t got  = base[adr & 0x1fff];
+      if (want != got) {
+        static int n = 0;
+        if (n++ < 40)
+          printf("ROMPAGE MISMATCH adr=%06lx bank=%02x off=%04x fast=%02x slow=%02x "
+                 "type=%d romSize=%lu ramSize=%lu lowRom=%d\n",
+                 (unsigned long)adr, bank, off, got, want, cart->type,
+                 (unsigned long)cart->romSize, (unsigned long)cart->ramSize,
+                 (int)cart->bankLowRom[bank]);
+      }
+    }
+#endif
+    return base[adr & 0x1fff];
   }
+#if SNES_ROMPAGE_LOW
+  if(SNES_BANK_LOW_ROM(cart, bank)) {
+#ifdef RIG_CALL_PROFILE
+    g_cpuRead_romhit++;
+#endif
+    uint8_t got = (cart->type == 1) ? cart->bankBase[bank & 0x7f][off & 0x7fff]
+                                    : cart->bankBase[bank & 0x3f][off];
+#ifdef SNES_ROMPAGE_VERIFY
+    {
+      uint8_t want = snes_read(snes, adr);
+      if (want != got) {
+        static int nl = 0;
+        if (nl++ < 40)
+          printf("ROMPAGE LOW MISMATCH adr=%06lx bank=%02x off=%04x fast=%02x "
+                 "slow=%02x type=%d ramSize=%lu\n",
+                 (unsigned long)adr, bank, off, got, want, cart->type,
+                 (unsigned long)cart->ramSize);
+      }
+    }
+#endif
+    return got;
+  }
+#endif
 #ifdef RIG_CALL_PROFILE
   g_cpuRead_slow++;
 #endif
