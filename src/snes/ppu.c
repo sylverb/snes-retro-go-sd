@@ -1764,6 +1764,66 @@ static void PpuDrawBackground_mosaic(Ppu *ppu, uint y, bool sub, uint layer,
   }
 }
 
+/* Mode 2 offset-per-tile: each 8px screen column can replace H and/or V
+ * scroll from BG3. One tile fetch per column, same 4bpp decode as the
+ * streaming drawer. column 0 never applies OPT (ppu_handleOPT). */
+static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
+                                       PpuZbufType zhi, PpuZbufType zlo) {
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer)
+                                      : PpuWindows_Clear(&win, ppu, layer);
+  PPU_BUF_MARK(sub);
+  BgLayer *bglayer = &ppu->bgLayer[layer];
+  bool big = bglayer->bigTiles;
+  enum { kPaletteShift = 6 };
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    int x = win.edges[windex];
+    int x2 = win.edges[windex + 1];
+    PpuZbufType *dstz = ppu->bgBuffers[sub].data + x + kPpuExtraLeftRight;
+    int run;
+    do {
+      run = IntMin(8 - (x & 7), x2 - x);
+      int lx = x + bglayer->hScroll;
+      int ly = (int)y + bglayer->vScroll;
+      ppu_handleOPT(ppu, layer, &lx, &ly);
+      lx &= 0x3ff;
+      ly &= 0x3ff;
+
+      int tileBitsX = big ? 4 : 3;
+      int tileHighBitX = big ? 0x200 : 0x100;
+      int tileBitsY = big ? 4 : 3;
+      int tileHighBitY = big ? 0x200 : 0x100;
+      uint16_t tilemapAdr = (uint16_t)(bglayer->tilemapAdr
+          + (((ly >> tileBitsY) & 0x1f) << 5 | ((lx >> tileBitsX) & 0x1f)));
+      if ((lx & tileHighBitX) && bglayer->tilemapWider)
+        tilemapAdr += 0x400;
+      if ((ly & tileHighBitY) && bglayer->tilemapHigher)
+        tilemapAdr += bglayer->tilemapWider ? 0x800 : 0x400;
+      uint16_t tile = ppu->vram[tilemapAdr & 0x7fff];
+
+      int row = (tile & 0x8000) ? 7 - (ly & 7) : (ly & 7);
+      uint32 tileNum = PpuBgCharFromMap(tile, (uint)lx, (uint)ly, big);
+      unsigned adr = (bglayer->tileAdr + tileNum * 16u + (unsigned)row) & 0x7fff;
+      uint32 bits = ppu->vram[adr] | (uint32)ppu->vram[(adr + 8) & 0x7fff] << 16;
+      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      z += (tile & 0x1c00) >> kPaletteShift;
+
+      for (int i = 0; i < run; i++) {
+        int col = (tile & 0x4000) ? ((lx + i) & 7) : 7 - ((lx + i) & 7);
+        int pixel = ((bits >> col) & 1) | ((bits >> (7 + col)) & 2)
+                  | ((bits >> (14 + col)) & 4) | ((bits >> (21 + col)) & 8);
+        if (pixel && z > dstz[i])
+          dstz[i] = z + (PpuZbufType)pixel;
+      }
+    } while (x += run, dstz += run, x < x2);
+  }
+}
+
 // Draw a whole line of a 4bpp background layer into bgBuffers
 static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
 /* SNES_ABLATE_BG=2: keep the tilemap walk and the VRAM fetch, delete only the
@@ -3039,13 +3099,17 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     PpuDrawBackground_2bpp(ppu, y, sub, 2, 0x5200 + 64, 0x2200 + 64, 0);
     PpuDrawBackground_2bpp(ppu, y, sub, 3, 0x4300 + 96, 0x1300 + 96, 0);
   } else if (ppu->mode == 2) {
-    /* Mode 2 without OPT: BG1+BG2 4bpp. Hardware order
-     * S3 BG1p1 S2 BG2p1 S1 BG1p0 S0 BG2p0. OPT still uses the per-pixel
-     * path (PpuMode2HasOpt). */
+    /* Mode 2: BG1+BG2 4bpp. Streaming walk when OPT is unused; per-column
+     * ppu_handleOPT otherwise. Hardware order S3 BG1p1 S2 BG2p1 S1 BG1p0 S0 BG2p0. */
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, true);
-    PpuDrawBackground_4bpp(ppu, y, sub, 0, 0xc000, 0x4000);
-    PpuDrawBackground_4bpp(ppu, y, sub, 1, 0x9100, 0x1100);
+    if (PpuMode2HasOpt(ppu)) {
+      PpuDrawBackground_4bpp_opt(ppu, y, sub, 0, 0xc000, 0x4000);
+      PpuDrawBackground_4bpp_opt(ppu, y, sub, 1, 0x9100, 0x1100);
+    } else {
+      PpuDrawBackground_4bpp(ppu, y, sub, 0, 0xc000, 0x4000);
+      PpuDrawBackground_4bpp(ppu, y, sub, 1, 0x9100, 0x1100);
+    }
   } else if (ppu->mode == 4) {
     /* Mode 4: BG1 8bpp + BG2 2bpp. Hardware order
      * S3 BG1p1 S2 BG2p1 S1 BG1p0 S0 BG2p0. Sprite ranks are 14/10/6/2 in
@@ -3055,7 +3119,7 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x4000);
     PpuDrawBackground_2bpp(ppu, y, sub, 1, 0x9100, 0x1100, 0);
   } else {
-    /* Mode 7 only. Modes 3/5/6, and Mode 2/4 with OPT, are handled in
+    /* Mode 7 only. Modes 3/5/6, and Mode 4 with OPT, are handled in
      * PpuDrawWholeLine via ppu_handlePixel; do not treat them as affine. */
     PpuDrawBackground_mode7(ppu, y, sub, 0x5000);
     if (ppu->lineHasSprites)
@@ -3245,12 +3309,11 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     return;
   }
 #endif
-  /* Fast drawers cover mode 0, 1 (8×8 and 16×16), 2 and 4 without
-   * offset-per-tile, and 7. Remaining modes 3/5/6, and Mode 2/4 with OPT,
+  /* Fast drawers cover mode 0, 1 (8×8 and 16×16), 2 (4bpp+OPT), 4 without
+   * offset-per-tile, and 7. Remaining modes 3/5/6, and Mode 4 with OPT,
    * go through LakeSnes per-pixel. Mosaic stays in the fast drawers. */
   if (ppu->mode >= 2 && ppu->mode <= 6 &&
-      !((ppu->mode == 4 && !PpuMode4HasOpt(ppu)) ||
-        (ppu->mode == 2 && !PpuMode2HasOpt(ppu)))) {
+      !(ppu->mode == 2 || (ppu->mode == 4 && !PpuMode4HasOpt(ppu)))) {
     for (int x = 0; x < 256; x++)
       ppu_handlePixel(ppu, x, (int)y);
 #ifdef TARGET_GNW
