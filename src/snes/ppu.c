@@ -3227,8 +3227,14 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
       PpuDrawSprites(ppu, y, sub, true);
     PpuDrawBackground_hires(ppu, y, sub, 0, 0xc000, 0x4000, 4);
     PpuDrawBackground_hires(ppu, y, sub, 1, 0x9100, 0x1100, 2);
+  } else if (ppu->mode == 6) {
+    /* Mode 6: BG1 4bpp hires + OPT. Hardware has no BG2.
+     * PpuDrawBackground_hires already calls ppu_handleOPT. */
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+    PpuDrawBackground_hires(ppu, y, sub, 0, 0xc000, 0x4000, 4);
   } else {
-    /* Mode 7 only. Mode 6, and Mode 4 with OPT, stay on ppu_handlePixel. */
+    /* Mode 7 only. Mode 4 with OPT stays on ppu_handlePixel. */
     PpuDrawBackground_mode7(ppu, y, sub, 0x5000);
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, false);
@@ -3417,10 +3423,9 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     return;
   }
 #endif
-  /* Fast drawers cover mode 0, 1 (8×8 and 16×16), 2 (4bpp+OPT), 3
-   * (8bpp+4bpp), 4 without offset-per-tile, 5 (hires 4bpp+2bpp), and 7.
-   * Remaining: mode 6, and Mode 4 with OPT. Mosaic stays in the drawers. */
-  if (ppu->mode == 6 || (ppu->mode == 4 && PpuMode4HasOpt(ppu))) {
+  /* Fast drawers cover modes 0–3, 4 without OPT, 5, 6 (hires+OPT), and 7.
+   * Remaining: Mode 4 with offset-per-tile. Mosaic stays in the drawers. */
+  if (ppu->mode == 4 && PpuMode4HasOpt(ppu)) {
     for (int x = 0; x < 256; x++)
       ppu_handlePixel(ppu, x, (int)y);
 #ifdef TARGET_GNW
