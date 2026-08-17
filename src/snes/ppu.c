@@ -2259,7 +2259,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 /* See the 4bpp drawer: the ALU stands in for the second load of the chase. */
 #define READ_BITS(ta, tile) (addr = ppu->vram, (uint32)(ta) + (uint32)(tile) * 8u)
 #else
-#define READ_BITS(ta, tile) (PPU_PROBE_VRAM_ADR((ta) + (tile) * 8), addr = &ppu->vram[(ta) + (tile) * 8 & 0x7fff], addr[0])
+#define READ_BITS(ta, tile) (PPU_PROBE_VRAM_ADR((ta) + (tile) * 8), addr = &ppu->vram[((ta) + (tile) * 8) & 0x7fff], addr[0])
 #endif
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
@@ -2732,7 +2732,13 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
      * means the port needs a real mosaic implementation for that game. */
     PpuDrawBackground_4bpp(ppu, y, sub, 0, 0xc000, 0x8000);
     PpuDrawBackground_4bpp(ppu, y, sub, 1, 0xb100, 0x7100);
-    PpuDrawBackground_2bpp(ppu, y, sub, 2, 0xf200, 0x1200, 0x2000);
+    /* $2105 bit 3 raises BG3 to rank 15. Without it, BG3 prio-1 is rank 3
+     * (under BG1/BG2). Hardcoding the Zelda-3 constants put Pilotwings' HUD
+     * under BG3's 2bpp tiles. */
+    PpuDrawBackground_2bpp(ppu, y, sub, 2,
+                           ppu->bg3priority ? 0xf200 : 0x3200,
+                           0x1200,
+                           ppu->bg3priority ? 0x2000 : 0);
 #else
     if (IS_MOSAIC_ENABLED(ppu, 0))
       assert(0);
@@ -2747,7 +2753,10 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     if (IS_MOSAIC_ENABLED(ppu, 2))
       assert(0);
     else
-      PpuDrawBackground_2bpp(ppu, y, sub, 2, 0xf200, 0x1200, 0x2000);
+      PpuDrawBackground_2bpp(ppu, y, sub, 2,
+                             ppu->bg3priority ? 0xf200 : 0x3200,
+                             0x1200,
+                             ppu->bg3priority ? 0x2000 : 0);
 #endif
   } else if (ppu->mode == 0) {
     /* Mode 0: four 2bpp layers, each with its own 32-colour CGRAM window
