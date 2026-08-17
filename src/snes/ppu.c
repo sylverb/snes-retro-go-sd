@@ -1658,6 +1658,19 @@ uint64_t g_tile_opaque_px[2];
 uint32_t g_sub_also_main, g_sub_only;
 #endif
 
+/* 16×16 tilemap entries cover four 8×8 characters: +1 for the right half
+ * (swapped if hflip), +0x10 for the bottom half (swapped if vflip). Same
+ * addressing as ppu_getPixelForBgLayer, so the fast drawers can keep their
+ * 8-pixel walk. */
+static inline uint32 PpuBgCharFromMap(uint32 tile, uint x, uint y, bool big) {
+  uint32 n = tile & 0x3ff;
+  if (big) {
+    if (((bool)(x & 8)) ^ ((bool)(tile & 0x4000))) n += 1;
+    if (((bool)(y & 8)) ^ ((bool)(tile & 0x8000))) n += 0x10;
+  }
+  return n;
+}
+
 // Draw a whole line of a 4bpp background layer into bgBuffers
 static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
 /* SNES_ABLATE_BG=2: keep the tilemap walk and the VRAM fetch, delete only the
@@ -1828,8 +1841,11 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer) : PpuWindows_Clear(&win, ppu, layer);
   BgLayer *bglayer = &ppu->bgLayer[layer];
   y += bglayer->vScroll;
-  int sc_offs = bglayer->tilemapAdr + (((y >> 3) & 0x1f) << 5);
-  if ((y & 0x100) && bglayer->tilemapHigher)
+  const bool big = bglayer->bigTiles;
+  const int y_shift = big ? 4 : 3;
+  const int y_screen = big ? 0x200 : 0x100;
+  int sc_offs = bglayer->tilemapAdr + (((y >> y_shift) & 0x1f) << 5);
+  if ((y & y_screen) && bglayer->tilemapHigher)
     sc_offs += bglayer->tilemapWider ? 0x800 : 0x400;
   const uint16 *tps[2] = {
     &ppu->vram[sc_offs & 0x7fff],
@@ -1887,9 +1903,11 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     uint x = win.edges[windex] + bglayer->hScroll;
     uint w = win.edges[windex + 1] - win.edges[windex];
     PpuZbufType *dstz = ppu->bgBuffers[sub].data + win.edges[windex] + kPpuExtraLeftRight;
-    const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
-    const uint16 *tp_last = tps[x >> 8 & 1] + 31;
-    const uint16 *tp_next = tps[(x >> 8 & 1) ^ 1];
+    const int x_shift = big ? 4 : 3;
+    const int x_screen = big ? 9 : 8;
+    const uint16 *tp = tps[x >> x_screen & 1] + ((x >> x_shift) & 0x1f);
+    const uint16 *tp_last = tps[x >> x_screen & 1] + 31;
+    const uint16 *tp_next = tps[(x >> x_screen & 1) ^ 1];
 #if SNES_ABLATE_WALK
 /* ABLATION, WRONG OUTPUT ON PURPOSE. `tp` never advances, so every tile in the
  * span is the same tilemap entry: the decode, the z-compare, the store and both
@@ -1906,12 +1924,14 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #else
 #define NEXT_TP() if (tp != tp_last) tp += 1; else tp = tp_next, tp_next = tp_last - 31, tp_last = tp + 31;
 #endif
+#define NEXT_MAP() do { if (!big || (x & 8)) { NEXT_TP(); } } while (0)
     // Handle clipped pixels on left side
     if (x & 7) {
       int curw = IntMin(8 - (x & 7), w);
+      int clip = curw;
       w -= curw;
       uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
-      NEXT_TP();
+      NEXT_MAP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
 #if SNES_PPU_TILE_MEMO
@@ -1923,11 +1943,11 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       if (tile == memo_key) {
         bits = memo_bits;
       } else {
-        bits = READ_BITS(ta, tile & 0x3ff);
+        bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
         memo_key = tile, memo_bits = bits;
       }
 #else
-      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      uint32 bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
 #endif
 #if SNES_RENDER_CENSUS
       { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
@@ -1939,15 +1959,16 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       if (bits) {
         z += ((tile & 0x1c00) >> kPaletteShift);
         if (tile & 0x4000) {
-          bits >>= (x & 7), x += curw;
+          bits >>= (x & 7);
           do DO_PIXEL(0); while (bits >>= 1, dstz++, --curw);
         } else {
-          bits <<= (x & 7), x += curw;
+          bits <<= (x & 7);
           do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --curw);
         }
       } else {
-        dstz += curw;
+        dstz += clip;
       }
+      x += clip;
     }
     // Handle full tiles in the middle
 #if SNES_PPU_PIPELINE
@@ -2053,7 +2074,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #else
     while (w >= 8) {
       uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
-      NEXT_TP();
+      NEXT_MAP();
 #if SNES_PPU_PREFETCH
       /* Start the NEXT tile's bitplane read now, and process this one while it
        * is in flight.
@@ -2089,11 +2110,11 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       if (tile == memo_key) {
         bits = memo_bits;
       } else {
-        bits = READ_BITS(ta, tile & 0x3ff);
+        bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
         memo_key = tile, memo_bits = bits;
       }
 #else
-      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      uint32 bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
 #endif
 #if SNES_RENDER_CENSUS
       { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
@@ -2164,7 +2185,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
         }
 #endif
       }
-      dstz += 8, w -= 8;
+      dstz += 8, w -= 8, x += 8;
     }
 #endif
     // Handle remaining clipped part
@@ -2181,11 +2202,11 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       if (tile == memo_key) {
         bits = memo_bits;
       } else {
-        bits = READ_BITS(ta, tile & 0x3ff);
+        bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
         memo_key = tile, memo_bits = bits;
       }
 #else
-      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      uint32 bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
 #endif
 #if SNES_RENDER_CENSUS
       { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
@@ -2212,6 +2233,8 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #undef DO_CHUNKY_PIXEL
 #undef DO_PIXEL
 #undef DO_PIXEL_HFLIP
+#undef NEXT_MAP
+#undef NEXT_TP
 }
 
 // Draw a whole line of a 2bpp background layer into bgBuffers.
@@ -2308,8 +2331,11 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer) : PpuWindows_Clear(&win, ppu, layer);
   BgLayer *bglayer = &ppu->bgLayer[layer];
   y += bglayer->vScroll;
-  int sc_offs = bglayer->tilemapAdr + (((y >> 3) & 0x1f) << 5);
-  if ((y & 0x100) && bglayer->tilemapHigher)
+  const bool big = bglayer->bigTiles;
+  const int y_shift = big ? 4 : 3;
+  const int y_screen = big ? 0x200 : 0x100;
+  int sc_offs = bglayer->tilemapAdr + (((y >> y_shift) & 0x1f) << 5);
+  if ((y & y_screen) && bglayer->tilemapHigher)
     sc_offs += bglayer->tilemapWider ? 0x800 : 0x400;
   const uint16 *tps[2] = {
     &ppu->vram[sc_offs & 0x7fff],
@@ -2345,9 +2371,11 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     uint x = win.edges[windex] + bglayer->hScroll;
     uint w = win.edges[windex + 1] - win.edges[windex];
     PpuZbufType *dstz = ppu->bgBuffers[sub].data + win.edges[windex] + kPpuExtraLeftRight;
-    const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
-    const uint16 *tp_last = tps[x >> 8 & 1] + 31;
-    const uint16 *tp_next = tps[(x >> 8 & 1) ^ 1];
+    const int x_shift = big ? 4 : 3;
+    const int x_screen = big ? 9 : 8;
+    const uint16 *tp = tps[x >> x_screen & 1] + ((x >> x_shift) & 0x1f);
+    const uint16 *tp_last = tps[x >> x_screen & 1] + 31;
+    const uint16 *tp_next = tps[(x >> x_screen & 1) ^ 1];
 
 #if SNES_ABLATE_WALK
 /* ABLATION, WRONG OUTPUT ON PURPOSE. `tp` never advances, so every tile in the
@@ -2365,12 +2393,14 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #else
 #define NEXT_TP() if (tp != tp_last) tp += 1; else tp = tp_next, tp_next = tp_last - 31, tp_last = tp + 31;
 #endif
+#define NEXT_MAP() do { if (!big || (x & 8)) { NEXT_TP(); } } while (0)
     // Handle clipped pixels on left side
     if (x & 7) {
       int curw = IntMin(8 - (x & 7), w);
+      int clip = curw;
       w -= curw;
       uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
-      NEXT_TP();
+      NEXT_MAP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
 #if SNES_PPU_TILE_MEMO
@@ -2382,11 +2412,11 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       if (tile == memo_key) {
         bits = memo_bits;
       } else {
-        bits = READ_BITS(ta, tile & 0x3ff);
+        bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
         memo_key = tile, memo_bits = bits;
       }
 #else
-      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      uint32 bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
 #endif
 #if SNES_RENDER_CENSUS
       { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
@@ -2398,20 +2428,21 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       if (bits) {
         z += ((tile & 0x1c00) >> kPaletteShift);
         if (tile & 0x4000) {
-          bits >>= (x & 7), x += curw;
+          bits >>= (x & 7);
           do DO_PIXEL(0); while (bits >>= 1, dstz++, --curw);
         } else {
-          bits <<= (x & 7), x += curw;
+          bits <<= (x & 7);
           do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --curw);
         }
       } else {
-        dstz += curw;
+        dstz += clip;
       }
+      x += clip;
     }
     // Handle full tiles in the middle
     while (w >= 8) {
       uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
-      NEXT_TP();
+      NEXT_MAP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
 #if SNES_PPU_TILE_MEMO
@@ -2423,11 +2454,11 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       if (tile == memo_key) {
         bits = memo_bits;
       } else {
-        bits = READ_BITS(ta, tile & 0x3ff);
+        bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
         memo_key = tile, memo_bits = bits;
       }
 #else
-      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      uint32 bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
 #endif
 #if SNES_RENDER_CENSUS
       { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
@@ -2466,7 +2497,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
           }
         }
       }
-      dstz += 8, w -= 8;
+      dstz += 8, w -= 8, x += 8;
     }
     // Handle remaining clipped part
     if (w) {
@@ -2482,11 +2513,11 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       if (tile == memo_key) {
         bits = memo_bits;
       } else {
-        bits = READ_BITS(ta, tile & 0x3ff);
+        bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
         memo_key = tile, memo_bits = bits;
       }
 #else
-      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      uint32 bits = READ_BITS(ta, PpuBgCharFromMap(tile, x, y, big));
 #endif
 #if SNES_RENDER_CENSUS
       { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
@@ -2506,6 +2537,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     }
   }
 #undef NEXT_TP
+#undef NEXT_MAP
 #undef READ_BITS
 #undef DO_TOP_CHUNKY_PIXEL_HFLIP
 #undef DO_TOP_CHUNKY_PIXEL
@@ -2774,7 +2806,8 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     PpuDrawBackground_2bpp(ppu, y, sub, 2, 0x5200 + 64, 0x1200 + 64, 0);
     PpuDrawBackground_2bpp(ppu, y, sub, 3, 0x4300 + 96, 0x0300 + 96, 0);
   } else {
-    // mode 7
+    /* Mode 7 only. Modes 2–6 are handled in PpuDrawWholeLine via
+     * ppu_handlePixel; do not treat them as affine. */
     PpuDrawBackground_mode7(ppu, y, sub, 0x5000);
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, false);
@@ -2910,6 +2943,19 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 #ifdef TARGET_GNW
     if (g_ppu_line_cb)
       g_ppu_line_cb(y, (const uint16_t *)dst);
+#endif
+    return;
+  }
+
+  /* Fast drawers cover mode 0, 1 (8×8 and 16×16) and 7. Modes 2–6 have no
+   * fast drawer and used to fall through to Mode 7. LakeSnes per-pixel
+   * implements those modes. */
+  if (ppu->mode >= 2 && ppu->mode <= 6) {
+    for (int x = 0; x < 256; x++)
+      ppu_handlePixel(ppu, x, (int)y);
+#ifdef TARGET_GNW
+    if (g_ppu_line_cb)
+      g_ppu_line_cb(y, (const uint16_t *)&ppu->renderBuffer[(y - 1) * ppu->renderPitch]);
 #endif
     return;
   }
