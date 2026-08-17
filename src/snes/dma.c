@@ -213,9 +213,20 @@ void dma_doDma(Dma* dma) {
 
   DmaChannel* ch = &dma->channel[i];
 
+  /* SMW/Zelda homebrew used this as a "DMA from FastROM $00-$7FFF" canary
+   * (those windows are WRAM/MMIO on LoROM $80-$BF). On HiROM, $C0-$FF is a
+   * full 64 KB of ROM, so Secret of Evermore's $C6:2053 is a normal cart
+   * upload — not a fault. Same for LoROM $40-$7F/$C0-$FF. Only warn when
+   * the A-bus source is actually the system area. */
   if (!ch->fromB && (ch->aBank & 0x80) && !(ch->aAdr & 0x8000) && !g_fail) {
-    printf("Warning! DMA from addr 0x%x\n", ch->aBank << 16 | ch->aAdr);
-    g_fail = true;
+    uint8_t b7 = ch->aBank & 0x7f;
+    int cart_type = (dma->snes && dma->snes->cart) ? dma->snes->cart->type : 0;
+    bool a_is_rom = (cart_type == 1 || cart_type == 2) &&
+                    (ch->aAdr >= 0x8000 || b7 >= 0x40);
+    if (!a_is_rom) {
+      printf("Warning! DMA from addr 0x%x\n", ch->aBank << 16 | ch->aAdr);
+      g_fail = true;
+    }
   }
 
   if (ch->fromB) {
