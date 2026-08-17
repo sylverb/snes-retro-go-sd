@@ -34,8 +34,13 @@
 #include "odroid_overlay.h"
 #include "crc32.h"
 
+#ifndef HOST_BUILD
 #include "gw_core_bridge.h"
 #include "gw_core_i18n.h"
+#else
+#include "host_compat.h"
+#include "gw_core_i18n.h"
+#endif
 
 void draw_error_screen(const char *main_line, const char *line_1, const char *line_2);
 
@@ -1004,7 +1009,7 @@ __attribute__((section(".itcm_snes_interp.thumb2.bus")))
 void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 {
   gw_core_bridge_init();
-  ram_start = (uint32_t)(uintptr_t)&__CORE_BSS_END__;
+  /* Firmware / host shim seeds ram_start before entry; only rewind the bump. */
   ram_init();
   /* Firmware already dtc_init()'d in emulator_start() (ACTIVE_FILE was copied
    * to AHB first). Rewind again so this core owns a known-empty DTCM bump —

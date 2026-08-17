@@ -7,7 +7,7 @@
  * share fill / rd / pushed / primed. The push runs in main-loop context and
  * guards the shared fields with a brief IRQ disable. On the host (tests) there
  * is no ISR, so the macros are no-ops. */
-#ifdef TARGET_GNW
+#if defined(TARGET_GNW) && !defined(HOST_BUILD)
 /* main.h for the CMSIS intrinsics. Without it these are implicit declarations
  * that the host build never sees, because there they are macros -- the device
  * build is the one that fails, and that is the lie CLAUDE.md warns about.

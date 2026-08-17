@@ -1,6 +1,8 @@
 # SNES (LakeSnes) — standalone Retro-Go SD dynamic core.
 #
 #   make / make docker
+#   make host             — Linux/macOS SDL binary (same src/main_snes.c)
+#   make host HOST_SDL=3  — same with SDL3
 #
 # Output: snes.bin → /cores/snes.bin ; ROMs under /roms/snes/ (.sfc .smc .fig .swc)
 #
@@ -190,3 +192,8 @@ docker_pull:
 
 docker_shell:
 	$(DOCKER_RUN) bash
+
+#######################################
+# Host SDL (Linux / macOS)
+#######################################
+include host/Makefile.host
