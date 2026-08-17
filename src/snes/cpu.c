@@ -931,7 +931,23 @@ restart:
       uint32_t addr = (cpu->k << 16) | cpu->pc | 0x800000;
       switch (opcode = CpuOpcodeHook(addr - 1)) {
       case 0:
+#ifdef GNW_SNES_CORE
+        /* CpuOpcodeHook is a Super Metroid leftover: return 0 meant "NOP".
+         * Soul Blazer uses BRK as a real software interrupt — skip the
+         * signature, push PBR/PC/P, take $00:FFE6. Same shape as COP. */
+        cpu_readOpcode(cpu);
+        cpu_pushByte(cpu, cpu->k);
+        cpu_pushWord(cpu, cpu->pc);
+        cpu_pushByte(cpu, cpu_getFlags(cpu));
+        cpu->cyclesUsed++;
+        cpu->i = true;
+        cpu->d = false;
+        cpu->k = 0;
+        cpu->pc = cpu_readWord(cpu, 0xffe6, 0xffe7);
         break;
+#else
+        break;
+#endif
       case 1: // rts
         cpu->pc = cpu_pullWord(cpu) + 1;
         break;
