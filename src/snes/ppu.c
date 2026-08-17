@@ -332,6 +332,17 @@ static void ppu_rebuild_packed_registers(Ppu *ppu) {
   ppu->screenWindowed[0] = tmw;
   ppu->screenWindowed[1] = tsw;
 
+  /* $2106 lives past pixelbuffer_placeholder too. ppu_write() packs the
+   * layer enable bits into mosaicEnabled; a load only restores
+   * bgLayer[].mosaicEnabled. */
+  {
+    uint8_t mos = 0;
+    for (int i = 0; i < 4; i++)
+      if (ppu->bgLayer[i].mosaicEnabled)
+        mos |= (uint8_t)(1 << i);
+    ppu->mosaicEnabled = mos;
+  }
+
   /* windowsel is six 4-bit fields, one per layer, in the order GET_WINDOW_FLAGS
    * indexes them — the same nibble ppu_write() packs from $2123..$2125. */
   uint32_t sel = 0;
@@ -1673,6 +1684,85 @@ static inline uint32 PpuBgCharFromMap(uint32 tile, uint x, uint y, bool big) {
   return n;
 }
 
+/* Mosaic ($2106): sample the top-left of each N×N screen block and splat into
+ * the z-buffer. X is aligned to 0, Y to mosaicStartLine — same as
+ * ppu_getPixel. Palette encoding matches the 2/4/8bpp fast drawers (Mode 0
+ * CGRAM windows live in zhi/zlo). Called only when mosaicSize > 1. */
+static void PpuDrawBackground_mosaic(Ppu *ppu, uint y, bool sub, uint layer,
+                                     PpuZbufType zhi, PpuZbufType zlo, int bpp) {
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer)
+                                      : PpuWindows_Clear(&win, ppu, layer);
+  PPU_BUF_MARK(sub);
+
+  int size = ppu->mosaicSize;
+  int sy = (int)y - ((int)y - (int)ppu->mosaicStartLine) % size;
+  BgLayer *bglayer = &ppu->bgLayer[layer];
+  int ly = (sy + bglayer->vScroll) & 0x3ff;
+  bool big = bglayer->bigTiles;
+  bool wide = big || ppu->mode == 5 || ppu->mode == 6;
+  int pal_shift = (bpp == 4) ? 6 : 8;
+  int tile_pitch = 4 * bpp;
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    int x = win.edges[windex];
+    int x2 = win.edges[windex + 1];
+    PpuZbufType *dstz = ppu->bgBuffers[sub].data + x + kPpuExtraLeftRight;
+    int w = size - (x % size);
+    do {
+      w = IntMin(w, x2 - x);
+      int lx = (x - (x % size) + bglayer->hScroll) & 0x3ff;
+
+      int tileBitsX = wide ? 4 : 3;
+      int tileHighBitX = wide ? 0x200 : 0x100;
+      int tileBitsY = big ? 4 : 3;
+      int tileHighBitY = big ? 0x200 : 0x100;
+      uint16_t tilemapAdr = (uint16_t)(bglayer->tilemapAdr
+          + (((ly >> tileBitsY) & 0x1f) << 5 | ((lx >> tileBitsX) & 0x1f)));
+      if ((lx & tileHighBitX) && bglayer->tilemapWider)
+        tilemapAdr += 0x400;
+      if ((ly & tileHighBitY) && bglayer->tilemapHigher)
+        tilemapAdr += bglayer->tilemapWider ? 0x800 : 0x400;
+      uint16_t tile = ppu->vram[tilemapAdr & 0x7fff];
+
+      int row = (tile & 0x8000) ? 7 - (ly & 7) : (ly & 7);
+      int col = (tile & 0x4000) ? (lx & 7) : 7 - (lx & 7);
+      uint32 tileNum = PpuBgCharFromMap(tile, (uint)lx, (uint)ly, big);
+      unsigned adr = (bglayer->tileAdr + tileNum * (unsigned)tile_pitch + (unsigned)row) & 0x7fff;
+      uint16_t plane1 = ppu->vram[adr];
+      int pixel = (plane1 >> col) & 1;
+      pixel |= ((plane1 >> (8 + col)) & 1) << 1;
+      if (bpp >= 4) {
+        uint16_t plane2 = ppu->vram[(adr + 8) & 0x7fff];
+        pixel |= ((plane2 >> col) & 1) << 2;
+        pixel |= ((plane2 >> (8 + col)) & 1) << 3;
+      }
+      if (bpp >= 8) {
+        uint16_t plane3 = ppu->vram[(adr + 16) & 0x7fff];
+        pixel |= ((plane3 >> col) & 1) << 4;
+        pixel |= ((plane3 >> (8 + col)) & 1) << 5;
+        uint16_t plane4 = ppu->vram[(adr + 24) & 0x7fff];
+        pixel |= ((plane4 >> col) & 1) << 6;
+        pixel |= ((plane4 >> (8 + col)) & 1) << 7;
+      }
+
+      if (pixel) {
+        PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+        if (bpp < 8)
+          z += (tile & 0x1c00) >> pal_shift;
+        PpuZbufType zv = z + (PpuZbufType)pixel;
+        int i = 0;
+        do {
+          if (z > dstz[i])
+            dstz[i] = zv;
+        } while (++i != w);
+      }
+    } while (x += w, dstz += w, w = size, x < x2);
+  }
+}
+
 // Draw a whole line of a 4bpp background layer into bgBuffers
 static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
 /* SNES_ABLATE_BG=2: keep the tilemap walk and the VRAM fetch, delete only the
@@ -1799,6 +1889,10 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+  if (IS_MOSAIC_ENABLED(ppu, layer) && ppu->mosaicSize > 1) {
+    PpuDrawBackground_mosaic(ppu, y, sub, layer, zhi, zlo, 4);
+    return;
+  }
 #if SNES_PPU_VIRGIN_Z
   const bool no_ztest = PPU_BUF_VIRGIN(sub) && (uint32)zlo > (uint32)kPpuBackdropZ;
 #else
@@ -2289,6 +2383,10 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+  if (IS_MOSAIC_ENABLED(ppu, layer) && ppu->mosaicSize > 1) {
+    PpuDrawBackground_mosaic(ppu, y, sub, layer, zhi, zlo, 2);
+    return;
+  }
 #if SNES_PPU_VIRGIN_Z
   const bool no_ztest = PPU_BUF_VIRGIN(sub) && (uint32)zlo > (uint32)kPpuBackdropZ;
 #else
@@ -2555,6 +2653,10 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 static void PpuDrawBackground_8bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;
+  if (IS_MOSAIC_ENABLED(ppu, layer) && ppu->mosaicSize > 1) {
+    PpuDrawBackground_mosaic(ppu, y, sub, layer, zhi, zlo, 8);
+    return;
+  }
   PPU_BUF_MARK(sub);
   PpuWindows win;
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer) : PpuWindows_Clear(&win, ppu, layer);
@@ -2729,9 +2831,9 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
   int clippedV = vScroll - yCenter;
   clippedH = (clippedH & 0x2000) ? (clippedH | ~1023) : (clippedH & 1023);
   clippedV = (clippedV & 0x2000) ? (clippedV | ~1023) : (clippedV & 1023);
-  bool mosaic_enabled = IS_MOSAIC_ENABLED(ppu, 0);
+  bool mosaic_enabled = IS_MOSAIC_ENABLED(ppu, 0) && ppu->mosaicSize > 1;
   if (mosaic_enabled)
-    y = ppu->mosaicModulo[y];
+    y -= (y - ppu->mosaicStartLine) % ppu->mosaicSize;
   uint32 ry = ppu->m7yFlip ? 255 - y : y;
   uint32 m7startX = (ppu->m7matrix[0] * clippedH & ~63) + (ppu->m7matrix[1] * ry & ~63) +
     (ppu->m7matrix[1] * clippedV & ~63) + (xCenter << 8);
@@ -2751,7 +2853,7 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
     uint32 outside_value = ppu->m7largeField ? 0x3ffff : 0xffffffff;
     bool char_fill = ppu->m7charFill;
     if (mosaic_enabled) {
-      int w = ppu->mosaicSize - (x - ppu->mosaicModulo[x]);
+      int w = ppu->mosaicSize - (x % ppu->mosaicSize);
       do {
         w = IntMin(w, dstz_end - dstz);
         if ((uint32)(xpos | ypos) > outside_value) {
@@ -2886,12 +2988,7 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
       PpuDrawSprites(ppu, y, sub, true);
 
 #ifdef GNW_SNES_CORE
-    /* General-purpose core: mosaic is a screen-transition effect half the
-     * commercial library uses (fades in Zelda, F-Zero, menu wipes...). This
-     * renderer has no mosaic path -- draw the background UN-mosaiced instead
-     * of dying: the transition looks plain, the game keeps running. The
-     * asserts stay for the sm/zelda3 dev builds below, where hitting one
-     * means the port needs a real mosaic implementation for that game. */
+    /* Mosaic ($2106) is handled inside the 4bpp/2bpp drawers. */
     PpuDrawBackground_4bpp(ppu, y, sub, 0, 0xc000, 0x8000);
     PpuDrawBackground_4bpp(ppu, y, sub, 1, 0xb100, 0x7100);
     /* $2105 bit 3 raises BG3 to rank 15. Without it, BG3 prio-1 is rank 3
@@ -3103,7 +3200,8 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       prev = key;
       fprintf(stderr,
               "ppu: mode=%u blank=%d bright=%u clip=%u prevent=%u "
-              "big=%d%d%d%d mosaic=%02x tm=%02x ts=%02x tw=%02x tsw=%02x "
+              "big=%d%d%d%d mosaic=%02x size=%u start=%u bgmos=%d%d%d%d "
+              "tm=%02x ts=%02x tw=%02x tsw=%02x "
               "math=%d%d%d%d%d%d addsub=%d hires=%d sprites=%d "
               "win=%u-%u/%u-%u extra=%u "
               "cgram0=%03x cgram1=%03x c32=%03x c64=%03x c96=%03x\n",
@@ -3111,7 +3209,10 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
               ppu->clipMode, ppu->preventMathMode,
               (int)ppu->bgLayer[0].bigTiles, (int)ppu->bgLayer[1].bigTiles,
               (int)ppu->bgLayer[2].bigTiles, (int)ppu->bgLayer[3].bigTiles,
-              ppu->mosaicEnabled, ppu->screenEnabled[0], ppu->screenEnabled[1],
+              ppu->mosaicEnabled, ppu->mosaicSize, ppu->mosaicStartLine,
+              (int)ppu->bgLayer[0].mosaicEnabled, (int)ppu->bgLayer[1].mosaicEnabled,
+              (int)ppu->bgLayer[2].mosaicEnabled, (int)ppu->bgLayer[3].mosaicEnabled,
+              ppu->screenEnabled[0], ppu->screenEnabled[1],
               ppu->screenWindowed[0], ppu->screenWindowed[1],
               (int)ppu->mathEnabled[0], (int)ppu->mathEnabled[1],
               (int)ppu->mathEnabled[2], (int)ppu->mathEnabled[3],
@@ -3137,7 +3238,7 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 #endif
   /* Fast drawers cover mode 0, 1 (8×8 and 16×16), 4 (8bpp+2bpp, no OPT)
    * and 7. Remaining modes 2/3/5/6, and Mode 4 with offset-per-tile, go
-   * through LakeSnes per-pixel. */
+   * through LakeSnes per-pixel. Mosaic stays in the fast drawers. */
   if (ppu->mode >= 2 && ppu->mode <= 6 &&
       !(ppu->mode == 4 && !PpuMode4HasOpt(ppu))) {
     for (int x = 0; x < 256; x++)
@@ -4241,6 +4342,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       ppu->bgLayer[1].mosaicEnabled = val & 0x2;
       ppu->bgLayer[2].mosaicEnabled = val & 0x4;
       ppu->bgLayer[3].mosaicEnabled = val & 0x8;
+      ppu->mosaicEnabled = val & 0x0f;
       ppu->mosaicSize = (val >> 4) + 1;
       ppu->mosaicStartLine = 0;// ppu->snes->vPos;
       break;
