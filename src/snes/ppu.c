@@ -84,6 +84,7 @@ static void ppu_handlePixel(Ppu* ppu, int x, int y);
 static int ppu_getPixel(Ppu* ppu, int x, int y, bool sub, int* r, int* g, int* b);
 static uint16_t ppu_getOffsetValue(Ppu* ppu, int col, int row);
 static bool PpuMode4HasOpt(Ppu *ppu);
+static bool PpuMode2HasOpt(Ppu *ppu);
 static int ppu_getPixelForBgLayer(Ppu* ppu, int x, int y, int layer, bool priority);
 static void ppu_handleOPT(Ppu* ppu, int layer, int* lx, int* ly);
 static void ppu_calculateMode7Starts(Ppu* ppu, int y);
@@ -3037,6 +3038,14 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     PpuDrawBackground_2bpp(ppu, y, sub, 1, 0xc100 + 32, 0x8100 + 32, 0);
     PpuDrawBackground_2bpp(ppu, y, sub, 2, 0x5200 + 64, 0x2200 + 64, 0);
     PpuDrawBackground_2bpp(ppu, y, sub, 3, 0x4300 + 96, 0x1300 + 96, 0);
+  } else if (ppu->mode == 2) {
+    /* Mode 2 without OPT: BG1+BG2 4bpp. Hardware order
+     * S3 BG1p1 S2 BG2p1 S1 BG1p0 S0 BG2p0. OPT still uses the per-pixel
+     * path (PpuMode2HasOpt). */
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+    PpuDrawBackground_4bpp(ppu, y, sub, 0, 0xc000, 0x4000);
+    PpuDrawBackground_4bpp(ppu, y, sub, 1, 0x9100, 0x1100);
   } else if (ppu->mode == 4) {
     /* Mode 4: BG1 8bpp + BG2 2bpp. Hardware order
      * S3 BG1p1 S2 BG2p1 S1 BG1p0 S0 BG2p0. Sprite ranks are 14/10/6/2 in
@@ -3046,8 +3055,8 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x4000);
     PpuDrawBackground_2bpp(ppu, y, sub, 1, 0x9100, 0x1100, 0);
   } else {
-    /* Mode 7 only. Modes 2–6 are handled in PpuDrawWholeLine via
-     * ppu_handlePixel; do not treat them as affine. */
+    /* Mode 7 only. Modes 3/5/6, and Mode 2/4 with OPT, are handled in
+     * PpuDrawWholeLine via ppu_handlePixel; do not treat them as affine. */
     PpuDrawBackground_mode7(ppu, y, sub, 0x5000);
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, false);
@@ -3236,11 +3245,12 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     return;
   }
 #endif
-  /* Fast drawers cover mode 0, 1 (8×8 and 16×16), 4 (8bpp+2bpp, no OPT)
-   * and 7. Remaining modes 2/3/5/6, and Mode 4 with offset-per-tile, go
-   * through LakeSnes per-pixel. Mosaic stays in the fast drawers. */
+  /* Fast drawers cover mode 0, 1 (8×8 and 16×16), 2 and 4 without
+   * offset-per-tile, and 7. Remaining modes 3/5/6, and Mode 2/4 with OPT,
+   * go through LakeSnes per-pixel. Mosaic stays in the fast drawers. */
   if (ppu->mode >= 2 && ppu->mode <= 6 &&
-      !(ppu->mode == 4 && !PpuMode4HasOpt(ppu))) {
+      !((ppu->mode == 4 && !PpuMode4HasOpt(ppu)) ||
+        (ppu->mode == 2 && !PpuMode2HasOpt(ppu)))) {
     for (int x = 0; x < 256; x++)
       ppu_handlePixel(ppu, x, (int)y);
 #ifdef TARGET_GNW
@@ -3791,6 +3801,14 @@ static uint16_t ppu_getOffsetValue(Ppu* ppu, int col, int row) {
 static bool PpuMode4HasOpt(Ppu *ppu) {
   for (int c = 0; c < 32; c++) {
     if (ppu_getOffsetValue(ppu, c, 0) & 0x6000)
+      return true;
+  }
+  return false;
+}
+
+static bool PpuMode2HasOpt(Ppu *ppu) {
+  for (int c = 0; c < 32; c++) {
+    if ((ppu_getOffsetValue(ppu, c, 0) | ppu_getOffsetValue(ppu, c, 1)) & 0x6000)
       return true;
   }
   return false;
