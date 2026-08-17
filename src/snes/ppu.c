@@ -1824,6 +1824,101 @@ static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
   }
 }
 
+/* Mode 5/6: 512-wide layer, 256-wide output. LakeSnes samples
+ * lx = (x + hofs)*2 + (sub ? 0 : 1) so the main screen keeps the odd
+ * hires pixels (the RGB565 path never averages the pair). Tiles are
+ * always 16 pixels wide in that 512-space; 16×16 if bigTiles. */
+static void PpuDrawBackground_hires(Ppu *ppu, uint y, bool sub, uint layer,
+                                    PpuZbufType zhi, PpuZbufType zlo, int bpp) {
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer)
+                                      : PpuWindows_Clear(&win, ppu, layer);
+  PPU_BUF_MARK(sub);
+  BgLayer *bglayer = &ppu->bgLayer[layer];
+  bool big = bglayer->bigTiles;
+  bool mosaic = IS_MOSAIC_ENABLED(ppu, layer) && ppu->mosaicSize > 1;
+  int phase = (sub || mosaic) ? 0 : 1;
+  int pal_shift = (bpp == 4) ? 6 : 8;
+  unsigned tile_pitch = (unsigned)(4 * bpp);
+  bool do_opt = ppu->mode == 6;
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    int x = win.edges[windex];
+    int x2 = win.edges[windex + 1];
+    PpuZbufType *dstz = ppu->bgBuffers[sub].data + x + kPpuExtraLeftRight;
+    int run;
+    do {
+      int sx = x, sy = (int)y;
+      if (mosaic) {
+        sx -= sx % ppu->mosaicSize;
+        sy -= (sy - (int)ppu->mosaicStartLine) % ppu->mosaicSize;
+      }
+      int lx = (sx + (int)bglayer->hScroll) * 2 + phase;
+      int ly = sy;
+      if (ppu->interlace) {
+        ly *= 2;
+        ly += (ppu->evenFrame || mosaic) ? 0 : 1;
+      }
+      ly += (int)bglayer->vScroll;
+      if (do_opt)
+        ppu_handleOPT(ppu, (int)layer, &lx, &ly);
+      lx &= 0x3ff;
+      ly &= 0x3ff;
+
+      int tileBitsY = big ? 4 : 3;
+      int tileHighBitY = big ? 0x200 : 0x100;
+      uint16_t tilemapAdr = (uint16_t)(bglayer->tilemapAdr
+          + (((ly >> tileBitsY) & 0x1f) << 5 | ((lx >> 4) & 0x1f)));
+      if ((lx & 0x200) && bglayer->tilemapWider)
+        tilemapAdr += 0x400;
+      if ((ly & tileHighBitY) && bglayer->tilemapHigher)
+        tilemapAdr += bglayer->tilemapWider ? 0x800 : 0x400;
+      uint16_t tile = ppu->vram[tilemapAdr & 0x7fff];
+
+      int row = (tile & 0x8000) ? 7 - (ly & 7) : (ly & 7);
+      uint32 tileNum = tile & 0x3ff;
+      if (((bool)(lx & 8)) ^ ((bool)(tile & 0x4000))) tileNum += 1;
+      if (big && (((bool)(ly & 8)) ^ ((bool)(tile & 0x8000)))) tileNum += 0x10;
+      unsigned adr = (bglayer->tileAdr + tileNum * tile_pitch + (unsigned)row) & 0x7fff;
+      uint32 bits = ppu->vram[adr];
+      if (bpp >= 4)
+        bits |= (uint32)ppu->vram[(adr + 8) & 0x7fff] << 16;
+
+      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      z += (tile & 0x1c00) >> pal_shift;
+
+      if (mosaic) {
+        run = IntMin(ppu->mosaicSize - (x % ppu->mosaicSize), x2 - x);
+        int col = (tile & 0x4000) ? (lx & 7) : 7 - (lx & 7);
+        int pixel = ((bits >> col) & 1) | ((bits >> (7 + col)) & 2);
+        if (bpp >= 4)
+          pixel |= ((bits >> (14 + col)) & 4) | ((bits >> (21 + col)) & 8);
+        if (pixel) {
+          PpuZbufType zv = z + (PpuZbufType)pixel;
+          for (int i = 0; i < run; i++) {
+            if (z > dstz[i])
+              dstz[i] = zv;
+          }
+        }
+      } else {
+        run = IntMin((9 - (lx & 7)) / 2, x2 - x);
+        for (int i = 0; i < run; i++) {
+          int col = (tile & 0x4000) ? ((lx + 2 * i) & 7) : 7 - ((lx + 2 * i) & 7);
+          int pixel = ((bits >> col) & 1) | ((bits >> (7 + col)) & 2);
+          if (bpp >= 4)
+            pixel |= ((bits >> (14 + col)) & 4) | ((bits >> (21 + col)) & 8);
+          if (pixel && z > dstz[i])
+            dstz[i] = z + (PpuZbufType)pixel;
+        }
+      }
+    } while (x += run, dstz += run, x < x2);
+  }
+}
+
 // Draw a whole line of a 4bpp background layer into bgBuffers
 static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
 /* SNES_ABLATE_BG=2: keep the tilemap walk and the VRAM fetch, delete only the
@@ -3125,9 +3220,15 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
       PpuDrawSprites(ppu, y, sub, true);
     PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x4000);
     PpuDrawBackground_4bpp(ppu, y, sub, 1, 0x9100, 0x1100);
+  } else if (ppu->mode == 5) {
+    /* Mode 5: BG1 4bpp + BG2 2bpp, 512-wide tiles shown at 256.
+     * Same priority ranks as Mode 2/3/4. */
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+    PpuDrawBackground_hires(ppu, y, sub, 0, 0xc000, 0x4000, 4);
+    PpuDrawBackground_hires(ppu, y, sub, 1, 0x9100, 0x1100, 2);
   } else {
-    /* Mode 7 only. Modes 5/6, and Mode 4 with OPT, are handled in
-     * PpuDrawWholeLine via ppu_handlePixel; do not treat them as affine. */
+    /* Mode 7 only. Mode 6, and Mode 4 with OPT, stay on ppu_handlePixel. */
     PpuDrawBackground_mode7(ppu, y, sub, 0x5000);
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, false);
@@ -3317,12 +3418,9 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   }
 #endif
   /* Fast drawers cover mode 0, 1 (8×8 and 16×16), 2 (4bpp+OPT), 3
-   * (8bpp+4bpp), 4 without offset-per-tile, and 7. Remaining modes 5/6,
-   * and Mode 4 with OPT, go through LakeSnes per-pixel. Mosaic stays in
-   * the fast drawers. */
-  if (ppu->mode >= 2 && ppu->mode <= 6 &&
-      !(ppu->mode == 2 || ppu->mode == 3 ||
-        (ppu->mode == 4 && !PpuMode4HasOpt(ppu)))) {
+   * (8bpp+4bpp), 4 without offset-per-tile, 5 (hires 4bpp+2bpp), and 7.
+   * Remaining: mode 6, and Mode 4 with OPT. Mosaic stays in the drawers. */
+  if (ppu->mode == 6 || (ppu->mode == 4 && PpuMode4HasOpt(ppu))) {
     for (int x = 0; x < 256; x++)
       ppu_handlePixel(ppu, x, (int)y);
 #ifdef TARGET_GNW
