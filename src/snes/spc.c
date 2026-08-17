@@ -1016,7 +1016,8 @@ static void spc_doOpcode(Spc* spc, uint8_t opcode) {
       uint16_t ya = spc->a | (spc->y << 8);
       int result = ya + value;
       spc->v = (ya & 0x8000) == (value & 0x8000) && (value & 0x8000) != (result & 0x8000);
-      spc->h = ((ya & 0xfff) + (value & 0xfff) + 1) > 0xfff;
+      /* H is carry from bit 11. The +1 belongs only on SUBW (two's complement). */
+      spc->h = ((ya & 0xfff) + (value & 0xfff)) > 0xfff;
       spc->c = result > 0xffff;
       spc->z = (result & 0xffff) == 0;
       spc->n = result & 0x8000;
@@ -1171,18 +1172,23 @@ static void spc_doOpcode(Spc* spc, uint8_t opcode) {
       break;
     }
     case 0x9e: { // div imp
-      // TODO: proper division algorithm
-      uint16_t value = spc->a | (spc->y << 8);
-      int result = 0xffff;
-      int mod = spc->a;
-      if(spc->x != 0) {
-        result = value / spc->x;
-        mod = value % spc->x;
+      /* Hardware restoring-div, not C / and %. V if Y>=X; H from low nibbles.
+       * Y < 2*X: 8-bit quotient (truncates if YA/X > 255). Else overflow /
+       * X=0 wrap: A = 255 - (YA - X<<9)/(256-X), Y = X + remainder. */
+      uint16_t ya = spc->a | (spc->y << 8);
+      uint8_t x = spc->x;
+      uint8_t y = spc->y;
+      spc->v = y >= x;
+      spc->h = (y & 0xf) >= (x & 0xf);
+      if(y < ((int)x << 1)) {
+        spc->a = x ? (uint8_t)(ya / x) : 0xff;
+        spc->y = x ? (uint8_t)(ya % x) : y;
+      } else {
+        uint16_t num = (uint16_t)(ya - ((uint16_t)x << 9));
+        uint16_t den = (uint16_t)(256 - x);
+        spc->a = (uint8_t)(255 - num / den);
+        spc->y = (uint8_t)(x + num % den);
       }
-      spc->v = result > 0xff;
-      spc->h = (spc->x & 0xf) <= (spc->y & 0xf);
-      spc->a = result;
-      spc->y = mod;
       spc_setZN(spc, spc->a);
       break;
     }
