@@ -83,6 +83,7 @@ static const int spriteSizes[8][2] = {
 static void ppu_handlePixel(Ppu* ppu, int x, int y);
 static int ppu_getPixel(Ppu* ppu, int x, int y, bool sub, int* r, int* g, int* b);
 static uint16_t ppu_getOffsetValue(Ppu* ppu, int col, int row);
+static bool PpuMode4HasOpt(Ppu *ppu);
 static int ppu_getPixelForBgLayer(Ppu* ppu, int x, int y, int layer, bool priority);
 static void ppu_handleOPT(Ppu* ppu, int layer, int* lx, int* ly);
 static void ppu_calculateMode7Starts(Ppu* ppu, int y);
@@ -2547,6 +2548,134 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #undef DO_PIXEL_HFLIP
 }
 
+/* Mode 3/4 BG1: 8bpp, 64 bytes per 8×8 character (four bitplanes). Colour is
+ * the pixel itself (no tilemap palette). Same 8-pixel walk as 4bpp, including
+ * 16×16 map entries. */
+static void PpuDrawBackground_8bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+  PPU_BUF_MARK(sub);
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer) : PpuWindows_Clear(&win, ppu, layer);
+  BgLayer *bglayer = &ppu->bgLayer[layer];
+  y += bglayer->vScroll;
+  const bool big = bglayer->bigTiles;
+  const int y_shift = big ? 4 : 3;
+  const int y_screen = big ? 0x200 : 0x100;
+  int sc_offs = bglayer->tilemapAdr + (((y >> y_shift) & 0x1f) << 5);
+  if ((y & y_screen) && bglayer->tilemapHigher)
+    sc_offs += bglayer->tilemapWider ? 0x800 : 0x400;
+  const uint16 *tps[2] = {
+    &ppu->vram[sc_offs & 0x7fff],
+    &ppu->vram[sc_offs + (bglayer->tilemapWider ? 0x400 : 0) & 0x7fff]
+  };
+  int tileadr = bglayer->tileAdr;
+  int tileadr1 = tileadr + 7 - (y & 7), tileadr0 = tileadr + (y & 7);
+  int pixel;
+#define LOAD_8BPP(ta, ch, lo, hi) do { \
+    unsigned a = ((unsigned)(ta) + (unsigned)(ch) * 32u) & 0x7fff; \
+    PPU_PROBE_VRAM_ADR(a); \
+    (lo) = ppu->vram[a] | (uint32)ppu->vram[(a + 8) & 0x7fff] << 16; \
+    (hi) = ppu->vram[(a + 16) & 0x7fff] | (uint32)ppu->vram[(a + 24) & 0x7fff] << 16; \
+  } while (0)
+#define DO_PIX8() do { \
+    pixel = (lo & 1) | (lo >> 7) & 2 | (lo >> 14) & 4 | (lo >> 21) & 8 \
+          | ((hi & 1) | (hi >> 7) & 2 | (hi >> 14) & 4 | (hi >> 21) & 8) << 4; \
+    if (pixel && z > dstz[0]) dstz[0] = z + pixel; \
+  } while (0)
+#define DO_PIX8_HFLIP() do { \
+    pixel = (lo >> 7) & 1 | (lo >> 14) & 2 | (lo >> 21) & 4 | (lo >> 28) & 8 \
+          | ((hi >> 7) & 1 | (hi >> 14) & 2 | (hi >> 21) & 4 | (hi >> 28) & 8) << 4; \
+    if (pixel && z > dstz[0]) dstz[0] = z + pixel; \
+  } while (0)
+#define DO_PIX8_I(i) do { \
+    pixel = (lo >> (i)) & 1 | (lo >> (7 + (i))) & 2 | (lo >> (14 + (i))) & 4 | (lo >> (21 + (i))) & 8 \
+          | ((hi >> (i)) & 1 | (hi >> (7 + (i))) & 2 | (hi >> (14 + (i))) & 4 | (hi >> (21 + (i))) & 8) << 4; \
+    if (pixel && z > dstz[i]) dstz[i] = z + pixel; \
+  } while (0)
+#define DO_PIX8_HFLIP_I(i) do { \
+    pixel = (lo >> (7 - (i))) & 1 | (lo >> (14 - (i))) & 2 | (lo >> (21 - (i))) & 4 | (lo >> (28 - (i))) & 8 \
+          | ((hi >> (7 - (i))) & 1 | (hi >> (14 - (i))) & 2 | (hi >> (21 - (i))) & 4 | (hi >> (28 - (i))) & 8) << 4; \
+    if (pixel && z > dstz[i]) dstz[i] = z + pixel; \
+  } while (0)
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    uint x = win.edges[windex] + bglayer->hScroll;
+    uint w = win.edges[windex + 1] - win.edges[windex];
+    PpuZbufType *dstz = ppu->bgBuffers[sub].data + win.edges[windex] + kPpuExtraLeftRight;
+    const int x_shift = big ? 4 : 3;
+    const int x_screen = big ? 9 : 8;
+    const uint16 *tp = tps[x >> x_screen & 1] + ((x >> x_shift) & 0x1f);
+    const uint16 *tp_last = tps[x >> x_screen & 1] + 31;
+    const uint16 *tp_next = tps[(x >> x_screen & 1) ^ 1];
+#define NEXT_TP() if (tp != tp_last) tp += 1; else tp = tp_next, tp_next = tp_last - 31, tp_last = tp + 31
+#define NEXT_MAP() do { if (!big || (x & 8)) { NEXT_TP(); } } while (0)
+    if (x & 7) {
+      int curw = IntMin(8 - (x & 7), w);
+      int clip = curw;
+      w -= curw;
+      uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
+      NEXT_MAP();
+      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      uint32 lo, hi;
+      LOAD_8BPP(ta, PpuBgCharFromMap(tile, x, y, big), lo, hi);
+      if (lo | hi) {
+        if (tile & 0x4000) {
+          lo >>= (x & 7); hi >>= (x & 7);
+          do { DO_PIX8(); } while (lo >>= 1, hi >>= 1, dstz++, --curw);
+        } else {
+          lo <<= (x & 7); hi <<= (x & 7);
+          do { DO_PIX8_HFLIP(); } while (lo <<= 1, hi <<= 1, dstz++, --curw);
+        }
+      } else {
+        dstz += clip;
+      }
+      x += clip;
+    }
+    while (w >= 8) {
+      uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
+      NEXT_MAP();
+      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      uint32 lo, hi;
+      LOAD_8BPP(ta, PpuBgCharFromMap(tile, x, y, big), lo, hi);
+      if (lo | hi) {
+        if (tile & 0x4000) {
+          DO_PIX8_I(0); DO_PIX8_I(1); DO_PIX8_I(2); DO_PIX8_I(3);
+          DO_PIX8_I(4); DO_PIX8_I(5); DO_PIX8_I(6); DO_PIX8_I(7);
+        } else {
+          DO_PIX8_HFLIP_I(0); DO_PIX8_HFLIP_I(1); DO_PIX8_HFLIP_I(2); DO_PIX8_HFLIP_I(3);
+          DO_PIX8_HFLIP_I(4); DO_PIX8_HFLIP_I(5); DO_PIX8_HFLIP_I(6); DO_PIX8_HFLIP_I(7);
+        }
+      }
+      dstz += 8, w -= 8, x += 8;
+    }
+    if (w) {
+      uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
+      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      uint32 lo, hi;
+      LOAD_8BPP(ta, PpuBgCharFromMap(tile, x, y, big), lo, hi);
+      if (lo | hi) {
+        if (tile & 0x4000) {
+          do { DO_PIX8(); } while (lo >>= 1, hi >>= 1, dstz++, --w);
+        } else {
+          do { DO_PIX8_HFLIP(); } while (lo <<= 1, hi <<= 1, dstz++, --w);
+        }
+      }
+    }
+#undef NEXT_MAP
+#undef NEXT_TP
+  }
+#undef DO_PIX8_HFLIP_I
+#undef DO_PIX8_I
+#undef DO_PIX8_HFLIP
+#undef DO_PIX8
+#undef LOAD_8BPP
+}
+
 // Assumes it's drawn on an empty backdrop
 static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
   int layer = 0;
@@ -2805,6 +2934,14 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     PpuDrawBackground_2bpp(ppu, y, sub, 1, 0xc100 + 32, 0x8100 + 32, 0);
     PpuDrawBackground_2bpp(ppu, y, sub, 2, 0x5200 + 64, 0x1200 + 64, 0);
     PpuDrawBackground_2bpp(ppu, y, sub, 3, 0x4300 + 96, 0x0300 + 96, 0);
+  } else if (ppu->mode == 4) {
+    /* Mode 4: BG1 8bpp + BG2 2bpp. Hardware order
+     * S3 BG1p1 S2 BG2p1 S1 BG1p0 S0 BG2p0. Sprite ranks are 14/10/6/2 in
+     * the high byte; the z constants sit in the gaps. */
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+    PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x4000);
+    PpuDrawBackground_2bpp(ppu, y, sub, 1, 0x9100, 0x1100, 0);
   } else {
     /* Mode 7 only. Modes 2–6 are handled in PpuDrawWholeLine via
      * ppu_handlePixel; do not treat them as affine. */
@@ -2950,7 +3087,40 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   /* Fast drawers cover mode 0, 1 (8×8 and 16×16) and 7. Modes 2–6 have no
    * fast drawer and used to fall through to Mode 7. LakeSnes per-pixel
    * implements those modes. */
-  if (ppu->mode >= 2 && ppu->mode <= 6) {
+#ifdef HOST_BUILD
+  if (getenv("HOST_PPU_LOG") && y == 1) {
+    static uint32 prev;
+    uint32 key = (uint32)ppu->mode
+      | ((uint32)ppu->bgLayer[0].bigTiles << 3)
+      | ((uint32)ppu->bgLayer[1].bigTiles << 4)
+      | ((uint32)ppu->mosaicEnabled << 8)
+      | ((uint32)ppu->screenEnabled[0] << 16)
+      | ((uint32)ppu->screenEnabled[1] << 24);
+    if (key != prev) {
+      prev = key;
+      fprintf(stderr,
+              "ppu: mode=%u big=%d%d%d%d mosaic=%02x tm=%02x ts=%02x tw=%02x "
+              "math=%d%d%d%d%d%d addsub=%d hires=%d sprites=%d "
+              "hofs=%d vofs=%d\n",
+              ppu->mode,
+              (int)ppu->bgLayer[0].bigTiles, (int)ppu->bgLayer[1].bigTiles,
+              (int)ppu->bgLayer[2].bigTiles, (int)ppu->bgLayer[3].bigTiles,
+              ppu->mosaicEnabled, ppu->screenEnabled[0], ppu->screenEnabled[1],
+              ppu->screenWindowed[0],
+              (int)ppu->mathEnabled[0], (int)ppu->mathEnabled[1],
+              (int)ppu->mathEnabled[2], (int)ppu->mathEnabled[3],
+              (int)ppu->mathEnabled[4], (int)ppu->mathEnabled[5],
+              (int)ppu->addSubscreen, (int)ppu->pseudoHires,
+              (int)ppu->lineHasSprites,
+              ppu->bgLayer[0].hScroll, ppu->bgLayer[0].vScroll);
+    }
+  }
+#endif
+  /* Fast drawers cover mode 0, 1 (8×8 and 16×16), 4 (8bpp+2bpp, no OPT)
+   * and 7. Remaining modes 2/3/5/6, and Mode 4 with offset-per-tile, go
+   * through LakeSnes per-pixel. */
+  if (ppu->mode >= 2 && ppu->mode <= 6 &&
+      !(ppu->mode == 4 && !PpuMode4HasOpt(ppu))) {
     for (int x = 0; x < 256; x++)
       ppu_handlePixel(ppu, x, (int)y);
 #ifdef TARGET_GNW
@@ -3496,6 +3666,14 @@ static uint16_t ppu_getOffsetValue(Ppu* ppu, int col, int row) {
   if((x & tileHighBit) && ppu->bgLayer[2].tilemapWider) tilemapAdr += 0x400;
   if((y & tileHighBit) && ppu->bgLayer[2].tilemapHigher) tilemapAdr += ppu->bgLayer[2].tilemapWider ? 0x800 : 0x400;
   return ppu->vram[tilemapAdr & 0x7fff];
+}
+
+static bool PpuMode4HasOpt(Ppu *ppu) {
+  for (int c = 0; c < 32; c++) {
+    if (ppu_getOffsetValue(ppu, c, 0) & 0x6000)
+      return true;
+  }
+  return false;
 }
 
 static int ppu_getPixelForBgLayer(Ppu* ppu, int x, int y, int layer, bool priority) {
