@@ -445,9 +445,11 @@ static uint8_t snes_readReg(Snes* snes, uint16_t adr) {
     case 0x4219:
       return SwapInputBits(snes->input1->currentState) >> 8;
     case 0x421a:
+      return SwapInputBits(snes->input2->currentState) & 0xff;
+    case 0x421b:
+      return SwapInputBits(snes->input2->currentState) >> 8;
     case 0x421c:
     case 0x421e:
-    case 0x421b:
     case 0x421d:
     case 0x421f:
       return 0;
