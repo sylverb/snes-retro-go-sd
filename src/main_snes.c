@@ -805,11 +805,9 @@ static void *snes_Screenshot(void) {
 
 #ifdef SNES_SMW_HLE_PRODUCT
 /* One-shot, quit-time-only flush of the audio-HLE swap status. Registered
- * below as BOTH sram_save_cb (fires from odroid_system_switch_app, i.e. the
- * in-game pause menu's Quit/Save&Quit) and shutdown_cb (fires from
- * odroid_system_shutdown, i.e. power-off/standby) -- SNES has no cart-SRAM
- * handler of its own to conflict with, and both call sites are single,
- * quit-time events, never the frame loop (rule-no-sd-write-during-play).
+ * as shutdown_cb (odroid_system_shutdown / power-off) and also chained from
+ * snes_SramSave so switch_app / sleep still dump it. Both call sites are
+ * single quit-time events, never the frame loop.
  * The load-time probe further below can only ever say the gate was ARMED
  * (wire_try_swap() needs ~180+ live frames it doesn't have yet at load) --
  * this is what actually answers whether the swap happened, and if not, the
@@ -841,6 +839,64 @@ static void snes_wire_diag_flush(void) {
   fclose(df);
 }
 #endif
+
+/* Cart battery SRAM as a sidecar /saves/<rom>.sram, same contract as the
+ * SMW / Zelda 3 / GBA ports. Savestates still snapshot cart RAM; the sidecar
+ * is what in-game Save writes persist across a cold launch. Firmware calls
+ * sram_save on app switch and sleep. Load the sidecar after ROM init and
+ * before a resumed savestate so the slot's cart RAM wins. */
+static void snes_SramSave(void)
+{
+  Cart *cart;
+
+  if (!snes || !snes->cart)
+    return;
+  cart = snes->cart;
+  if (!cart->ram || cart->ramSize == 0)
+    return;
+  if (!ACTIVE_FILE || !ACTIVE_FILE->path[0])
+    return;
+
+  wdog_refresh();
+  char *path = odroid_system_get_path(ODROID_PATH_SAVE_SRAM, ACTIVE_FILE->path);
+  if (path) {
+    FILE *f = fopen(path, "wb");
+    if (f) {
+      fwrite(cart->ram, 1, cart->ramSize, f);
+      fclose(f);
+    }
+    free(path);
+  }
+  wdog_refresh();
+#ifdef SNES_SMW_HLE_PRODUCT
+  snes_wire_diag_flush();
+#endif
+}
+
+static void snes_SramLoad(void)
+{
+  Cart *cart;
+
+  if (!snes || !snes->cart)
+    return;
+  cart = snes->cart;
+  if (!cart->ram || cart->ramSize == 0)
+    return;
+  if (!ACTIVE_FILE || !ACTIVE_FILE->path[0])
+    return;
+
+  wdog_refresh();
+  char *path = odroid_system_get_path(ODROID_PATH_SAVE_SRAM, ACTIVE_FILE->path);
+  if (path) {
+    FILE *f = fopen(path, "rb");
+    if (f) {
+      fread(cart->ram, 1, cart->ramSize, f);
+      fclose(f);
+    }
+    free(path);
+  }
+  wdog_refresh();
+}
 
 /* ---- ROM loading -----------------------------------------------------------
  * The cart stays memory-mapped in external flash (flash-cache machinery); the
@@ -1041,10 +1097,10 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
   snes_apply_frame_time();
 #ifdef SNES_SMW_HLE_PRODUCT
   odroid_system_emu_init(&snes_LoadState, &snes_SaveState, &snes_Screenshot,
-                         &snes_wire_diag_flush, NULL, &snes_wire_diag_flush, NULL);
+                         &snes_wire_diag_flush, NULL, &snes_SramSave, NULL);
 #else
   odroid_system_emu_init(&snes_LoadState, &snes_SaveState, &snes_Screenshot,
-                         NULL, NULL, NULL, NULL);
+                         NULL, NULL, &snes_SramSave, NULL);
 #endif
 
   /* Defer audio_start_playing until after ROM load: SAI DMA running during
@@ -1158,6 +1214,7 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
   printf("snes: bake on=%d sites=%lu pc=%02x:%04x dp=$%02x\n", (int)g_bake.on,
          (unsigned long)g_bake.sites, g_bake.bank, g_bake.pc_load, g_bake.dp_off);
 #endif
+  snes_SramLoad();
   snes_fps = snes->pal ? SNES_FPS_PAL : SNES_FPS_NTSC;
   snes_audio_samples = SNES_AUDIO_RATE / snes_fps;
   snes_apply_frame_time();

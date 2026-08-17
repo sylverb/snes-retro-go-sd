@@ -76,6 +76,7 @@ static size_t ram_pool_used;
 static int32_t settings_beep = 1;
 static state_handler_t host_load_state_cb;
 static state_handler_t host_save_state_cb;
+static sram_save_handler_t host_sram_save_cb;
 static const int host_default_slot = 0;
 
 bool odroid_system_emu_load_state(int slot);
@@ -253,10 +254,26 @@ int host_poll_events(void)
     return 1;
 }
 
+static int host_in_quit;
+
+static void host_flush_sram_once(void)
+{
+    if (host_in_quit)
+        return;
+    host_in_quit = 1;
+    if (host_sram_save_cb)
+        host_sram_save_cb();
+}
+
 static void host_maybe_quit(void)
 {
-    if (quit_requested)
-        exit(0);
+    /* SRAM save (and anything else in the quit path) calls wdog_refresh(),
+     * which polls events and comes back here. Re-enter and the stack blows
+     * (zsh: segmentation fault on window close). */
+    if (!quit_requested)
+        return;
+    host_flush_sram_once();
+    exit(0);
 }
 
 /* --- LCD ------------------------------------------------------------------ */
@@ -849,8 +866,9 @@ void odroid_system_emu_init(state_handler_t load_cb, state_handler_t save_cb,
 {
     host_load_state_cb = load_cb;
     host_save_state_cb = save_cb;
+    host_sram_save_cb = sram_save_cb;
     (void)screenshot_cb; (void)shutdown_cb;
-    (void)sleep_post_wakeup_cb; (void)sram_save_cb; (void)cheat_update_cb;
+    (void)sleep_post_wakeup_cb; (void)cheat_update_cb;
 }
 
 static rg_app_desc_t host_app_desc;
@@ -863,6 +881,7 @@ rg_app_desc_t *odroid_system_get_app(void)
 void odroid_system_switch_app(int app)
 {
     printf("host: odroid_system_switch_app(%d) — exiting\n", app);
+    host_flush_sram_once();
     host_platform_shutdown();
     exit(app == 0 ? 0 : 1);
 }
@@ -940,6 +959,29 @@ static int host_ensure_save_dir(void)
         return 0;
     perror("host: mkdir host_saves");
     return -1;
+}
+
+char *odroid_system_get_path(emu_path_type_t type, const char *romPath)
+{
+    char stem[64];
+    const char *name = (ACTIVE_FILE && ACTIVE_FILE->name[0]) ? ACTIVE_FILE->name : romPath;
+    char *out = malloc(512);
+
+    if (!out)
+        return NULL;
+    if (!name || !name[0])
+        name = "host";
+    host_sanitize_stem(stem, sizeof(stem), name);
+    if (type == ODROID_PATH_SAVE_SRAM) {
+        if (host_ensure_save_dir() != 0) {
+            free(out);
+            return NULL;
+        }
+        snprintf(out, 512, "host_saves/%s.sram", stem);
+    } else {
+        snprintf(out, 512, "host_saves/%s.path%d", stem, (int)type);
+    }
+    return out;
 }
 
 bool odroid_system_emu_load_state(int slot)
