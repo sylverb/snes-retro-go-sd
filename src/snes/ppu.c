@@ -1334,23 +1334,18 @@ static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer) {
     }
   }
   win->nr = nr;
-  // get a bitmap of how regions map to windows
-  uint8 w1_bits = 0, w2_bits = 0;
-  if (w1_ena) {
-    for (i = 0; win->edges[i] != ppu->window1left; i++);
-    for (j = i; win->edges[j] != ppu->window1right + 1; j++);
-    w1_bits = ((1 << (j - i)) - 1) << i;
+  /* Per-span mask — must match ppu_getWindowState (maskLogic XOR/AND/OR). The
+   * Snes9x w1_bits|w2_bits OR alone is wrong for logic != OR. */
+  win->bits = 0;
+  for (i = 0; i < nr; i++) {
+    int x = win->edges[i];
+    if (x < 0)
+      x = 0;
+    else if (x > 255)
+      x = 255;
+    if (ppu_getWindowState(ppu, (int)layer, x))
+      win->bits |= (uint8)(1 << i);
   }
-  if ((winflags & (kWindow1Enabled | kWindow1Inversed)) == (kWindow1Enabled | kWindow1Inversed))
-    w1_bits = ~w1_bits;
-  if (w2_ena) {
-    for (i = 0; win->edges[i] != ppu->window2left; i++);
-    for (j = i; win->edges[j] != ppu->window2right + 1; j++);
-    w2_bits = ((1 << (j - i)) - 1) << i;
-  }
-  if ((winflags & (kWindow2Enabled | kWindow2Inversed)) == (kWindow2Enabled | kWindow2Inversed))
-    w2_bits = ~w2_bits;
-  win->bits = w1_bits | w2_bits;
 }
 
 static inline uint32 PpuSpreadByteToNibbles(uint32 x) {
