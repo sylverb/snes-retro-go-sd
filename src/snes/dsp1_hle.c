@@ -46,51 +46,53 @@ uint8_t dsp1_readSR(Dsp1* d) {
 /* ---- command implementations ------------------------------------------- */
 
 static void attitude(Dsp1* d, int slot) {
-  /* in: m, Az, Ay, Ax -> build scaled rotation matrix (coordinate transform) */
-  double m = (double)d->in[0] / 32768.0;
-  double az = angle((uint16_t)d->in[1]);
-  double ay = angle((uint16_t)d->in[2]);
-  double ax = angle((uint16_t)d->in[3]);
-  double cz = cos(az), sz = sin(az);
-  double cy = cos(ay), sy = sin(ay);
-  double cx = cos(ax), sx = sin(ax);
-  /* R = Rx * Ry * Rz applied to row vectors: world -> object axes */
-  double r[3][3] = {
-    { cy * cz,                cy * sz,               -sy      },
-    { sx * sy * cz - cx * sz, sx * sy * sz + cx * cz, sx * cy },
-    { cx * sy * cz + sx * sz, cx * sy * sz - sx * cz, cx * cy },
-  };
-  for (int i = 0; i < 3; i++)
-    for (int j = 0; j < 3; j++)
-      d->matrix[slot][i][j] = clamp16(r[i][j] * m * 32768.0);
+  /* Chip Attitude (bsnes/snes9x, from the program ROM): M maps object
+   * (F,L,U) -> world (X,Y,Z) with scale S/2. Positive rotations are the
+   * FLU convention, not textbook Rx*Ry*Rz — the old matrix here used the
+   * textbook one at full S, so Objective/Subjective were both wrong-handed
+   * and ~2x too large. Pilotwings steers with those. */
+  double s = (double)(d->in[0] >> 1);
+  double rz = angle((uint16_t)d->in[1]);
+  double ry = angle((uint16_t)d->in[2]);
+  double rx = angle((uint16_t)d->in[3]);
+  double cz = cos(rz), sz = sin(rz);
+  double cy = cos(ry), sy = sin(ry);
+  double cx = cos(rx), sx = sin(rx);
+  int16_t (*m)[3] = d->matrix[slot];
+  m[0][0] = clamp16(s * cz * cy);
+  m[0][1] = clamp16(s * sz * cx + s * cz * sx * sy);
+  m[0][2] = clamp16(s * sz * sx - s * cz * cx * sy);
+  m[1][0] = clamp16(-s * sz * cy);
+  m[1][1] = clamp16(s * cz * cx - s * sz * sx * sy);
+  m[1][2] = clamp16(s * cz * sx + s * sz * cx * sy);
+  m[2][0] = clamp16(s * sy);
+  m[2][1] = clamp16(-s * sx * cy);
+  m[2][2] = clamp16(s * cx * cy);
 }
 
 static void objective(Dsp1* d, int slot) {
-  /* world (X,Y,Z) -> object frame (F,L,U): rows of M dot v */
-  for (int i = 0; i < 3; i++) {
-    double acc = 0;
-    for (int j = 0; j < 3; j++)
-      acc += (double)d->matrix[slot][i][j] * d->in[j];
-    d->out[i] = clamp16(acc / 32768.0);
-  }
+  /* world (X,Y,Z) -> object (F,L,U): M^T v  (M is object->world) */
+  const int16_t (*m)[3] = d->matrix[slot];
+  double x = d->in[0], y = d->in[1], z = d->in[2];
+  d->out[0] = clamp16((m[0][0] * x + m[1][0] * y + m[2][0] * z) / 32768.0);
+  d->out[1] = clamp16((m[0][1] * x + m[1][1] * y + m[2][1] * z) / 32768.0);
+  d->out[2] = clamp16((m[0][2] * x + m[1][2] * y + m[2][2] * z) / 32768.0);
 }
 
 static void subjective(Dsp1* d, int slot) {
-  /* object frame -> world: transpose (rotation matrices: inverse = transpose) */
-  for (int i = 0; i < 3; i++) {
-    double acc = 0;
-    for (int j = 0; j < 3; j++)
-      acc += (double)d->matrix[slot][j][i] * d->in[j];
-    d->out[i] = clamp16(acc / 32768.0);
-  }
+  /* object (F,L,U) -> world (X,Y,Z): M v */
+  const int16_t (*m)[3] = d->matrix[slot];
+  double f = d->in[0], l = d->in[1], u = d->in[2];
+  d->out[0] = clamp16((m[0][0] * f + m[0][1] * l + m[0][2] * u) / 32768.0);
+  d->out[1] = clamp16((m[1][0] * f + m[1][1] * l + m[1][2] * u) / 32768.0);
+  d->out[2] = clamp16((m[2][0] * f + m[2][1] * l + m[2][2] * u) / 32768.0);
 }
 
 static void scalar(Dsp1* d, int slot) {
-  /* forward-axis component of (X,Y,Z) in the object frame */
-  double acc = 0;
-  for (int j = 0; j < 3; j++)
-    acc += (double)d->matrix[slot][0][j] * d->in[j];
-  d->out[0] = clamp16(acc / 32768.0);
+  /* forward axis of M dotted with (X,Y,Z) — same as Objective's F */
+  const int16_t (*m)[3] = d->matrix[slot];
+  d->out[0] = clamp16((d->in[0] * m[0][0] + d->in[1] * m[1][0]
+                       + d->in[2] * m[2][0]) / 32768.0);
 }
 
 /* ---- projection group: Parameter / Raster / Project / Target -------------
@@ -295,30 +297,25 @@ static void cmd_target(Dsp1* d) {
 }
 
 static void cmd_inverse(Dsp1* d) {
-  /* floating inverse: value = in[0] * 2^in[1]; out mantissa Q15 in [0x4000,0x7fff] */
-  int16_t a = d->in[0];
-  int16_t e = d->in[1];
-  if (a == 0) { d->out[0] = 0x7fff; d->out[1] = 0x7fff; return; }
-  /* base is always exactly 2 with an integer exponent -- scalbn (direct
-   * exponent manipulation) is exact and avoids pulling the generic pow()
-   * (which pulls exp()/log()/log10()/fmod() with it: several KB nothing else
-   * in this command needs). */
-  double v = scalbn((double)a / 32768.0, e);
-  double inv = 1.0 / v;
-  int oe = 0;
-  double m = fabs(inv);
-  /* v can UNDERFLOW to exactly +-0.0 for e <~ -1060 (any nonzero a): then
-   * inv = +-Inf, and Inf/2.0 == Inf, so the normalization loop below never
-   * terminates -- a device hang for ~half of e's int16 range. The a==0
-   * early-return above only covers the literal-zero input, not the
-   * computed-underflow. Saturate exactly like that existing convention.
-   * (m == 0.0 is the mirror overflow case, inv underflowed: same treatment.) */
-  if (!isfinite(m) || m == 0.0) { d->out[0] = 0x7fff; d->out[1] = 0x7fff; return; }
-  while (m >= 1.0) { m /= 2.0; oe++; }
-  while (m < 0.5)  { m *= 2.0; oe--; }
-  if (inv < 0) m = -m;
-  d->out[0] = clamp16(m * 32768.0);
-  d->out[1] = (int16_t)oe;
+  /* Chip Inverse: normalize |coeff| into [0x4000,0x7fff], then
+   * iCoeff ≈ 2^29/coeff and iExp = 1 - exp. Zero returns (0x7fff, 0x002f). */
+  int16_t coeff = d->in[0];
+  int16_t exp = d->in[1];
+  if (coeff == 0) { d->out[0] = 0x7fff; d->out[1] = 0x002f; return; }
+  int sign = 1;
+  if (coeff < 0) {
+    if (coeff < -32767) coeff = -32767;
+    coeff = (int16_t)-coeff;
+    sign = -1;
+  }
+  while (coeff < 0x4000) { coeff = (int16_t)(coeff << 1); exp--; }
+  if (coeff == 0x4000) {
+    if (sign > 0) d->out[0] = 0x7fff;
+    else { d->out[0] = -0x4000; exp--; }
+  } else {
+    d->out[0] = clamp16((sign > 0 ? 536870912.0 : -536870912.0) / (double)coeff);
+  }
+  d->out[1] = (int16_t)(1 - exp);
 }
 
 static void execute(Dsp1* d) {
@@ -350,12 +347,12 @@ static void execute(Dsp1* d) {
       d->out[1] = clamp16(r * cos(th));
       return;
     }
-    case 0x08: {  /* radius: 32-bit (x^2+y^2+z^2)>>15, LSW first */
-      double x = d->in[0], y = d->in[1], z = d->in[2];
-      double r = (x * x + y * y + z * z) / 32768.0;
-      uint32_t r32 = (r >= 4294967295.0) ? 0xffffffffu : (uint32_t)r;
-      d->out[0] = (int16_t)(r32 & 0xffff);
-      d->out[1] = (int16_t)(r32 >> 16);
+    case 0x08: {  /* radius: 32-bit (x^2+y^2+z^2)<<1, LSW first */
+      int64_t r = ((int64_t)d->in[0] * d->in[0]
+                   + (int64_t)d->in[1] * d->in[1]
+                   + (int64_t)d->in[2] * d->in[2]) << 1;
+      d->out[0] = (int16_t)(uint16_t)r;
+      d->out[1] = (int16_t)(uint16_t)(r >> 16);
       return;
     }
     case 0x0c: {  /* rotate 2D (coordinate system): in A,X,Y */
@@ -391,10 +388,19 @@ static void execute(Dsp1* d) {
     case 0x06: cmd_project(d); return;
     case 0x0e: cmd_target(d); return;
     case 0x0a: raster_line(d, (int16_t)d->in[0]); return;   /* Vs is SIGNED */
-    case 0x14: {  /* gyrate: integrate angular velocities (docs sparse; see log) */
-      d->out[0] = (int16_t)(d->in[0] + d->in[3]);
-      d->out[1] = (int16_t)(d->in[1] + d->in[4]);
-      d->out[2] = (int16_t)(d->in[2] + d->in[5]);
+    case 0x14: {  /* gyrate: body-frame (U,F,L) onto Euler (Z,X,Y) */
+      /* Cos/Sin are Q15 on the chip, so U*cos is already in angle units.
+       * An extra /32768 killed stick input (Pilotwings drifted with no control). */
+      int16_t zr = d->in[0], xr = d->in[1], yr = d->in[2];
+      int16_t u  = d->in[3], f  = d->in[4], l  = d->in[5];
+      double ax = angle((uint16_t)xr), ay = angle((uint16_t)yr);
+      double cx = cos(ax), sx = sin(ax), cy = cos(ay), sy = sin(ay);
+      if (cx < 1e-8 && cx > -1e-8) cx = (cx < 0.0) ? -1e-8 : 1e-8;
+      double secx = 1.0 / cx;
+      d->out[0] = clamp16((double)zr + ((double)u * cy - (double)f * sy) * secx);
+      d->out[1] = clamp16((double)xr + ((double)u * sy + (double)f * cy));
+      d->out[2] = clamp16((double)yr + (double)l
+                         - ((double)u * cy + (double)f * sy) * sx * secx);
       return;
     }
     case 0x0f:
