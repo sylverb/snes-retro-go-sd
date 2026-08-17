@@ -415,7 +415,8 @@ static uint8_t snes_readReg(Snes* snes, uint16_t adr) {
     case 0x4210: {
       uint8_t val = 0x2; // CPU version (4 bit)
       val |= snes->inNmi << 7;
-
+      /* RDNMI: bit 7 is cleared on read (and at the end of vblank). */
+      snes->inNmi = false;
       return val | (snes->openBus & 0x70);
     }
     case 0x4211: {
