@@ -1449,8 +1449,9 @@ uint32_t g_comp_bypass, g_comp_blend, g_comp_subzero, g_comp_lines, g_comp_brigh
  *
  * ClearBackdrop fills both bg buffers with 0x0500 at the top of every drawn
  * line, so until something else has written to that buffer, `z > dstz[i]` is
- * true for every pixel of any layer whose z floor is above 0x0500 -- which is
- * every layer in modes 1 and 3-6, and all but the last in mode 0. The load, the
+ * true for every pixel of any layer whose z floor is above 0x0500 -- every
+ * BG layer in modes 0-1 and 3-6 (Mode 0 BG4 prio 0 is 0x13xx, not 0x03xx).
+ * The load, the
  * compare and its branch are then three instructions per pixel spent proving
  * something already known.
  *
@@ -2930,10 +2931,15 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
      * this used to fall through to the mode-7 renderer and drew garbage.) */
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, true);
+    /* z is [prio:4][layer:4][cgram:8]. Backdrop is 0x0500 (layer 5), so a
+     * prio-0 layer-3 word (0x03xx) loses the z test and BG4 vanishes — the
+     * Burn-in Test Cartridge Mode 0 screen is exactly that: TM=BG4, prio 0.
+     * Keep layer nibbles 2/3 and sit BG4p0 above 0x0500, BG3p0 above BG4p0,
+     * both still below sprite prio 0 (0x24xx). */
     PpuDrawBackground_2bpp(ppu, y, sub, 0, 0xd000,      0x9000,      0);
     PpuDrawBackground_2bpp(ppu, y, sub, 1, 0xc100 + 32, 0x8100 + 32, 0);
-    PpuDrawBackground_2bpp(ppu, y, sub, 2, 0x5200 + 64, 0x1200 + 64, 0);
-    PpuDrawBackground_2bpp(ppu, y, sub, 3, 0x4300 + 96, 0x0300 + 96, 0);
+    PpuDrawBackground_2bpp(ppu, y, sub, 2, 0x5200 + 64, 0x2200 + 64, 0);
+    PpuDrawBackground_2bpp(ppu, y, sub, 3, 0x4300 + 96, 0x1300 + 96, 0);
   } else if (ppu->mode == 4) {
     /* Mode 4: BG1 8bpp + BG2 2bpp. Hardware order
      * S3 BG1p1 S2 BG2p1 S1 BG1p0 S0 BG2p0. Sprite ranks are 14/10/6/2 in
@@ -3084,9 +3090,6 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     return;
   }
 
-  /* Fast drawers cover mode 0, 1 (8×8 and 16×16) and 7. Modes 2–6 have no
-   * fast drawer and used to fall through to Mode 7. LakeSnes per-pixel
-   * implements those modes. */
 #ifdef HOST_BUILD
   if (getenv("HOST_PPU_LOG") && y == 1) {
     static uint32 prev;
@@ -3099,21 +3102,37 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     if (key != prev) {
       prev = key;
       fprintf(stderr,
-              "ppu: mode=%u big=%d%d%d%d mosaic=%02x tm=%02x ts=%02x tw=%02x "
+              "ppu: mode=%u blank=%d bright=%u clip=%u prevent=%u "
+              "big=%d%d%d%d mosaic=%02x tm=%02x ts=%02x tw=%02x tsw=%02x "
               "math=%d%d%d%d%d%d addsub=%d hires=%d sprites=%d "
-              "hofs=%d vofs=%d\n",
-              ppu->mode,
+              "win=%u-%u/%u-%u extra=%u "
+              "cgram0=%03x cgram1=%03x c32=%03x c64=%03x c96=%03x\n",
+              ppu->mode, (int)ppu->forcedBlank, ppu->brightness,
+              ppu->clipMode, ppu->preventMathMode,
               (int)ppu->bgLayer[0].bigTiles, (int)ppu->bgLayer[1].bigTiles,
               (int)ppu->bgLayer[2].bigTiles, (int)ppu->bgLayer[3].bigTiles,
               ppu->mosaicEnabled, ppu->screenEnabled[0], ppu->screenEnabled[1],
-              ppu->screenWindowed[0],
+              ppu->screenWindowed[0], ppu->screenWindowed[1],
               (int)ppu->mathEnabled[0], (int)ppu->mathEnabled[1],
               (int)ppu->mathEnabled[2], (int)ppu->mathEnabled[3],
               (int)ppu->mathEnabled[4], (int)ppu->mathEnabled[5],
               (int)ppu->addSubscreen, (int)ppu->pseudoHires,
               (int)ppu->lineHasSprites,
-              ppu->bgLayer[0].hScroll, ppu->bgLayer[0].vScroll);
+              ppu->window1left, ppu->window1right,
+              ppu->window2left, ppu->window2right,
+              ppu->extraLeftRight,
+              ppu->cgram[0], ppu->cgram[1],
+              ppu->cgram[32], ppu->cgram[64], ppu->cgram[96]);
     }
+  }
+  if (getenv("HOST_PPU_SLOW")) {
+    for (int x = 0; x < 256; x++)
+      ppu_handlePixel(ppu, x, (int)y);
+#ifdef TARGET_GNW
+    if (g_ppu_line_cb)
+      g_ppu_line_cb(y, (const uint16_t *)&ppu->renderBuffer[(y - 1) * ppu->renderPitch]);
+#endif
+    return;
   }
 #endif
   /* Fast drawers cover mode 0, 1 (8×8 and 16×16), 4 (8bpp+2bpp, no OPT)
