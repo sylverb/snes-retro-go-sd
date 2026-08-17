@@ -3118,8 +3118,15 @@ PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
       PpuDrawSprites(ppu, y, sub, true);
     PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x4000);
     PpuDrawBackground_2bpp(ppu, y, sub, 1, 0x9100, 0x1100, 0);
+  } else if (ppu->mode == 3) {
+    /* Mode 3: BG1 8bpp + BG2 4bpp. Same priority ranks as Mode 2/4
+     * (S3 BG1p1 S2 BG2p1 S1 BG1p0 S0 BG2p0). No OPT. */
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+    PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x4000);
+    PpuDrawBackground_4bpp(ppu, y, sub, 1, 0x9100, 0x1100);
   } else {
-    /* Mode 7 only. Modes 3/5/6, and Mode 4 with OPT, are handled in
+    /* Mode 7 only. Modes 5/6, and Mode 4 with OPT, are handled in
      * PpuDrawWholeLine via ppu_handlePixel; do not treat them as affine. */
     PpuDrawBackground_mode7(ppu, y, sub, 0x5000);
     if (ppu->lineHasSprites)
@@ -3275,7 +3282,7 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
               "ppu: mode=%u blank=%d bright=%u clip=%u prevent=%u "
               "big=%d%d%d%d mosaic=%02x size=%u start=%u bgmos=%d%d%d%d "
               "tm=%02x ts=%02x tw=%02x tsw=%02x "
-              "math=%d%d%d%d%d%d addsub=%d hires=%d sprites=%d "
+              "math=%d%d%d%d%d%d addsub=%d hires=%d sprites=%d direct=%d "
               "win=%u-%u/%u-%u extra=%u "
               "cgram0=%03x cgram1=%03x c32=%03x c64=%03x c96=%03x\n",
               ppu->mode, (int)ppu->forcedBlank, ppu->brightness,
@@ -3291,7 +3298,7 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
               (int)ppu->mathEnabled[2], (int)ppu->mathEnabled[3],
               (int)ppu->mathEnabled[4], (int)ppu->mathEnabled[5],
               (int)ppu->addSubscreen, (int)ppu->pseudoHires,
-              (int)ppu->lineHasSprites,
+              (int)ppu->lineHasSprites, (int)ppu->directColor,
               ppu->window1left, ppu->window1right,
               ppu->window2left, ppu->window2right,
               ppu->extraLeftRight,
@@ -3309,11 +3316,13 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     return;
   }
 #endif
-  /* Fast drawers cover mode 0, 1 (8×8 and 16×16), 2 (4bpp+OPT), 4 without
-   * offset-per-tile, and 7. Remaining modes 3/5/6, and Mode 4 with OPT,
-   * go through LakeSnes per-pixel. Mosaic stays in the fast drawers. */
+  /* Fast drawers cover mode 0, 1 (8×8 and 16×16), 2 (4bpp+OPT), 3
+   * (8bpp+4bpp), 4 without offset-per-tile, and 7. Remaining modes 5/6,
+   * and Mode 4 with OPT, go through LakeSnes per-pixel. Mosaic stays in
+   * the fast drawers. */
   if (ppu->mode >= 2 && ppu->mode <= 6 &&
-      !(ppu->mode == 2 || (ppu->mode == 4 && !PpuMode4HasOpt(ppu)))) {
+      !(ppu->mode == 2 || ppu->mode == 3 ||
+        (ppu->mode == 4 && !PpuMode4HasOpt(ppu)))) {
     for (int x = 0; x < 256; x++)
       ppu_handlePixel(ppu, x, (int)y);
 #ifdef TARGET_GNW
