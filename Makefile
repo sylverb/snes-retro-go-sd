@@ -39,6 +39,7 @@ $(SNES)/dma.c \
 $(SNES)/dsp.c \
 $(SNES)/dsp1_hle.c \
 $(SNES)/cx4_hle.c \
+$(SNES)/sdd1.c \
 $(SNES)/input.c \
 $(SNES)/ppu.c \
 $(SNES)/snes.c \
@@ -117,6 +118,7 @@ $(BUILD_DIR)/dma.o \
 $(BUILD_DIR)/dsp.o \
 $(BUILD_DIR)/dsp1_hle.o \
 $(BUILD_DIR)/cx4_hle.o \
+$(BUILD_DIR)/sdd1.o \
 $(BUILD_DIR)/input.o \
 $(BUILD_DIR)/ppu.o \
 $(BUILD_DIR)/snes.o \

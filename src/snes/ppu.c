@@ -1851,6 +1851,68 @@ static void PpuDrawBackground_hires(Ppu *ppu, uint y, bool sub, uint layer,
   unsigned tile_pitch = (unsigned)(4 * bpp);
   bool do_opt = ppu->mode == 6;
 
+  /* Streaming path for Mode 5 without mosaic, OPT or interlace: walk the
+   * tilemap sequentially (like the 4bpp drawer) and subsample every other
+   * hires pixel via chunky decode instead of per-pixel bit extraction. */
+  if (!mosaic && !do_opt && !ppu->interlace && !big) {
+    int ly = ((int)y + (int)bglayer->vScroll) & 0x3ff;
+    int sc_row = (ly >> 3) & 0x1f;
+    int sc_y_hi = (ly & 0x100) && bglayer->tilemapHigher;
+    int tile_row_n = bglayer->tilemapAdr + (sc_row << 5);
+    int tile_row_w = sc_y_hi ? (bglayer->tilemapWider ? 0x800 : 0x400) : 0;
+
+    for (size_t windex = 0; windex < win.nr; windex++) {
+      if (win.bits & (1 << windex))
+        continue;
+      int x = win.edges[windex];
+      int x2 = win.edges[windex + 1];
+      PpuZbufType *dstz = ppu->bgBuffers[sub].data + x + kPpuExtraLeftRight;
+
+      while (x < x2) {
+        int lx = ((x + (int)bglayer->hScroll) * 2 + phase) & 0x3ff;
+        int sc_col = (lx >> 4) & 0x1f;
+        uint16_t tma = (uint16_t)(tile_row_n + sc_col);
+        if ((lx & 0x200) && bglayer->tilemapWider)
+          tma += 0x400;
+        tma += tile_row_w;
+        uint16_t tile = ppu->vram[tma & 0x7fff];
+
+        int row = (tile & 0x8000) ? 7 - (ly & 7) : (ly & 7);
+        uint32 tileNum = tile & 0x3ff;
+        if (((bool)(lx & 8)) ^ ((bool)(tile & 0x4000))) tileNum += 1;
+        unsigned adr = (bglayer->tileAdr + tileNum * tile_pitch + (unsigned)row) & 0x7fff;
+        uint32 bits = ppu->vram[adr];
+        if (bpp >= 4)
+          bits |= (uint32)ppu->vram[(adr + 8) & 0x7fff] << 16;
+
+        int run = IntMin((9 - (lx & 7)) / 2, x2 - x);
+
+        if (bits) {
+          uint32 chunky = (bpp >= 4) ? PpuDecode4bpp(bits) : PpuDecode2bpp(bits);
+          PpuZbufType z = ((tile & 0x2000) ? zhi : zlo)
+                        + ((tile & 0x1c00) >> pal_shift);
+          if (tile & 0x4000) {
+            for (int i = 0; i < run; i++) {
+              int pixel = (chunky >> (4 * ((lx + 2 * i) & 7))) & 0xf;
+              if (pixel && z > dstz[i])
+                dstz[i] = z + (PpuZbufType)pixel;
+            }
+          } else {
+            for (int i = 0; i < run; i++) {
+              int pixel = (chunky >> (4 * (7 - ((lx + 2 * i) & 7)))) & 0xf;
+              if (pixel && z > dstz[i])
+                dstz[i] = z + (PpuZbufType)pixel;
+            }
+          }
+        }
+
+        x += run;
+        dstz += run;
+      }
+    }
+    return;
+  }
+
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;

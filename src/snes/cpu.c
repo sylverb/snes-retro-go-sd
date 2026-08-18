@@ -9,6 +9,13 @@
 #include "snes.h"
 #include "types.h"
 #include "snes_gnw_alloc.h"
+#ifdef HOST_BUILD
+static int host_boot_trace_on(void) {
+  static int t = -1;
+  if (t < 0) t = getenv("HOST_BOOT_TRACE") ? 1 : 0;
+  return t;
+}
+#endif
 #ifndef GNW_SNES_CORE
 #include "../ida_types.h"
 #include "../enemy_types.h"
@@ -151,7 +158,17 @@ void cpu_reset(Cpu* cpu) {
   cpu->x = 0;
   cpu->y = 0;
   cpu->sp = 0x100;
-  cpu->pc = cpu_read(cpu, 0xfffc) | (cpu_read(cpu, 0xfffd) << 8);
+  {
+    uint8_t rv_lo = cpu_read(cpu, 0xfffc);
+    uint8_t rv_hi = cpu_read(cpu, 0xfffd);
+    cpu->pc = rv_lo | (rv_hi << 8);
+#ifdef HOST_BUILD
+    if (host_boot_trace_on()) {
+      printf("boot: resetvec [%02x %02x] -> %02x:%04x\n",
+             rv_lo, rv_hi, 0, cpu->pc);
+    }
+#endif
+  }
   cpu->dp = 0;
   cpu->k = 0;
   cpu->db = 0;
@@ -906,6 +923,17 @@ void DumpCpuHistory() {
 }
 
 static void cpu_doOpcode(Cpu* cpu, uint8_t opcode) {
+#ifdef HOST_BUILD
+  if (host_boot_trace_on()) {
+    static unsigned boot_trace_left = 256;
+    if (boot_trace_left) {
+      printf("boot: pc=%02x:%04x op=%02x a=%04x x=%04x y=%04x sp=%04x dp=%04x\n",
+             cpu->k, (uint16_t)(cpu->pc - 1), opcode,
+             cpu->a, cpu->x, cpu->y, cpu->sp, cpu->dp);
+      boot_trace_left--;
+    }
+  }
+#endif
 #ifdef SNES_PC_HISTOGRAM
   /* Per-ROM execution map: count every executed opcode by its 24-bit address, so
    * the hot banks/routines stand out. The histogram (16M entries) lives in the

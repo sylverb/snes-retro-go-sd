@@ -923,6 +923,8 @@ static bool cart_needs_coprocessor(const uint8_t *rom, uint32_t len) {
       if (romType >= 0x03 && (romType >> 4) != 0) {
         if ((romType >> 4) == 0x0F && h[0x0f] == 0x10) {
           /* Cx4 is supported */
+        } else if ((romType >> 4) == 0x04) {
+          /* S-DD1 is supported (Star Ocean, SFA2) */
         } else {
           return true;
         }

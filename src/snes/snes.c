@@ -12,6 +12,7 @@
 #include "dma.h"
 #include "ppu.h"
 #include "cart.h"
+#include "sdd1.h"
 #include "input.h"
 #include "tracing.h"
 #include "snes_gnw_alloc.h"
@@ -25,6 +26,22 @@ extern void RtlApuWrite(uint32_t adr, uint8_t val);
 
 static uint8_t snes_readReg(Snes* snes, uint16_t adr);
 static void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val);
+
+#ifdef HOST_BUILD
+static int host_boot_mmio_trace_on(void) {
+  static int t = -1;
+  if (t < 0) t = getenv("HOST_BOOT_MMIO") ? 1 : 0;
+  return t;
+}
+#define HOST_BOOT_MMIO_LOG(addr, val) do { \
+  if (host_boot_mmio_trace_on()) \
+    printf("bootmmio: %04x=%02x @%02x:%04x\n", \
+           (unsigned)(addr), (unsigned)(val), \
+           (unsigned)snes->cpu->k, (unsigned)snes->cpu->pc); \
+} while (0)
+#else
+#define HOST_BOOT_MMIO_LOG(addr, val) do {} while (0)
+#endif
 
 Snes* snes_init(uint8_t *ram) {
   Snes* snes = snes_zalloc(sizeof(Snes));
@@ -413,10 +430,19 @@ static uint16_t SwapInputBits(uint16_t x) {
 static uint8_t snes_readReg(Snes* snes, uint16_t adr) {
   switch(adr) {
     case 0x4210: {
+#ifdef HOST_BUILD
+      if (host_boot_mmio_trace_on())
+        printf("bootmmio-r: 4210 inNmi=%d @%02x:%04x\n",
+               (int)snes->inNmi,
+               (unsigned)snes->cpu->k, (unsigned)snes->cpu->pc);
+#endif
       uint8_t val = 0x2; // CPU version (4 bit)
       val |= snes->inNmi << 7;
-      /* RDNMI: bit 7 is cleared on read (and at the end of vblank). */
-      snes->inNmi = false;
+      /* Compatibility: keep RDNMI high while vblank is active.
+       * A few titles poll 4210 multiple times in the same vblank window; if the
+       * first read clears it immediately they can miss the event and deadloop. */
+      if (!snes->inVblank)
+        snes->inNmi = false;
       return val | (snes->openBus & 0x70);
     }
     case 0x4211: {
@@ -426,6 +452,12 @@ static uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       return val | (snes->openBus & 0x7f);
     }
     case 0x4212: {
+#ifdef HOST_BUILD
+      if (host_boot_mmio_trace_on())
+        printf("bootmmio-r: 4212 vblank=%d hblank=%d @%02x:%04x\n",
+               (int)snes->inVblank, (int)(snes->hPos >= 1024),
+               (unsigned)snes->cpu->k, (unsigned)snes->cpu->pc);
+#endif
       uint8_t val = (snes->autoJoyTimer > 0);
       val |= (snes->hPos >= 1024) << 6;
       val |= snes->inVblank << 7;
@@ -464,6 +496,9 @@ static uint8_t snes_readReg(Snes* snes, uint16_t adr) {
 static void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
   switch(adr) {
     case 0x4200: {
+      HOST_BOOT_MMIO_LOG(adr, val);
+      bool oldNmiEnabled = snes->nmiEnabled;
+      bool oldVirqEnabled = snes->vIrqEnabled;
       snes->autoJoyRead = val & 0x1;
       if(!snes->autoJoyRead) snes->autoJoyTimer = 0;
       snes->hIrqEnabled = val & 0x10;
@@ -473,8 +508,19 @@ static void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
         snes->inIrq = false;
         snes->cpu->irqWanted = false;
       }
-      // TODO: enabling nmi during vblank with inNmi still set generates nmi
-      //   enabling virq (and not h) on the vPos that vTimer is at generates irq (?)
+      /* SNES quirk: enabling NMI during active vblank asserts NMI immediately.
+       * Some games poll RDNMI/enable timing during bootstrap and can deadloop
+       * if this edge is delayed to the next frame. */
+      if (!oldNmiEnabled && snes->nmiEnabled && snes->inVblank) {
+        snes->inNmi = true;
+        snes->cpu->nmiWanted = true;
+      }
+      /* Similar behavior for V-IRQ enable on the matching line (without H-IRQ). */
+      if (!oldVirqEnabled && snes->vIrqEnabled && !snes->hIrqEnabled &&
+          snes->vPos == snes->vTimer) {
+        snes->inIrq = true;
+        snes->cpu->irqWanted = true;
+      }
       break;
     }
     case 0x4201: {
@@ -528,6 +574,7 @@ static void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       break;
     }
     case 0x420b: {
+      HOST_BOOT_MMIO_LOG(adr, val);
       if (val == 2) {
         uint32_t t = snes->dma->channel[1].aBank << 16 | snes->dma->channel[1].aAdr;
         int data = snes_read(snes, t) | snes_read(snes, t + 1) << 8;
@@ -541,6 +588,7 @@ static void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       break;
     }
     case 0x420c: {
+      HOST_BOOT_MMIO_LOG(adr, val);
       dma_startDma(snes->dma, val, true);
       break;
     }
@@ -576,6 +624,9 @@ uint8_t snes_read(Snes* snes, uint32_t adr) {
     }
     if(adr >= 0x4300 && adr < 0x4380) {
       return dma_read(snes->dma, adr); // dma registers
+    }
+    if(snes->cart->sdd1 && adr >= 0x4800 && adr < 0x4808) {
+      return sdd1_mmio_read(snes->cart->sdd1, adr);
     }
   }
 #if SNES_ROMPAGE_LOW == 2
@@ -616,6 +667,7 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
       }
     }
     if(adr >= 0x2100 && adr < 0x2200) {
+      if (adr == 0x2100) HOST_BOOT_MMIO_LOG(adr, val);
       snes_writeBBus(snes, adr & 0xff, val); // B-bus
     }
     if(adr == 0x4016) {
@@ -627,6 +679,11 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
     }
     if(adr >= 0x4300 && adr < 0x4380) {
       dma_write(snes->dma, adr, val); // dma registers
+      if(snes->cart->sdd1)
+        sdd1_mmio_write(snes->cart->sdd1, adr, val);
+    }
+    if(snes->cart->sdd1 && adr >= 0x4800 && adr < 0x4808) {
+      sdd1_mmio_write(snes->cart->sdd1, adr, val);
     }
   }
   // write to cart

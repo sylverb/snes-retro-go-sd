@@ -97,6 +97,10 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
   if(headers[used].coprocessor == 15 && headers[used].exCoprocessor == 16) {
     cart_attachCx4(snes->cart);
   }
+  // high nibble $4 = S-DD1 (Star Ocean / Street Fighter Alpha 2).
+  if(headers[used].coprocessor == 4 && headers[used].chips >= 3 && headers[used].chips <= 5) {
+    cart_attachSdd1(snes->cart);
+  }
   snes_reset(snes, true); // reset after loading
   snes_set_region(snes, headers[used].pal);
   return true;
@@ -132,6 +136,9 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
   }
   if(headers[used].coprocessor == 15 && headers[used].exCoprocessor == 16) {
     cart_attachCx4(snes->cart);
+  }
+  if(headers[used].coprocessor == 4 && headers[used].chips >= 3 && headers[used].chips <= 5) {
+    cart_attachSdd1(snes->cart);
   }
   snes_reset(snes, true); // reset after loading
   snes_set_region(snes, headers[used].pal);

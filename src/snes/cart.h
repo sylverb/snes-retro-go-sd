@@ -14,6 +14,7 @@ typedef struct Cart Cart;
 
 typedef struct Dsp1 Dsp1;
 typedef struct Cx4 Cx4;
+typedef struct Sdd1 Sdd1;
 
 struct Cart {
   Snes* snes;
@@ -40,6 +41,8 @@ struct Cart {
   Dsp1* dsp1;
   /* Capcom Cx4 (LoROM $00-$3F:$6000-$7FFF). NULL for normal carts. */
   Cx4* cx4;
+  /* S-DD1 decompression (HiROM, Star Ocean / SFA2). NULL for normal carts. */
+  Sdd1* sdd1;
 };
 
 // TODO: how to handle reset & load? (especially where to init ram)
@@ -48,6 +51,7 @@ Cart* cart_init(Snes* snes);
 void cart_setRomSize(Cart* cart, int size);
 void cart_attachDsp1(Cart* cart);   /* call after cart_load for DSP carts */
 void cart_attachCx4(Cart* cart);    /* call after cart_load for Cx4 carts */
+void cart_attachSdd1(Cart* cart);   /* call after cart_load for S-DD1 carts */
 void cart_free(Cart* cart);
 void cart_reset(Cart* cart); // will reset special chips etc, general reading is set up in load
 void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize); // TODO: figure out how to handle (battery, cart-chips etc)

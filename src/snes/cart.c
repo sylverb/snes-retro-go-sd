@@ -8,6 +8,7 @@
 #include "snes.h"
 #include "dsp1_hle.h"
 #include "cx4_hle.h"
+#include "sdd1.h"
 #include "snes_gnw_alloc.h"
 
 /* Weak fallbacks so build scripts that list snes/*.c files explicitly and
@@ -33,6 +34,15 @@ __attribute__((weak)) void cx4_write(Cx4* c, uint16_t a, uint8_t v,
 }
 __attribute__((weak)) Cx4* cx4_alloc(void) { return NULL; }
 __attribute__((weak)) uint32_t cx4_size(void) { return 0; }
+
+__attribute__((weak)) void sdd1_reset(Sdd1* s) { (void)s; }
+__attribute__((weak)) uint8_t sdd1_mmio_read(Sdd1* s, uint16_t a) { (void)s; (void)a; return 0; }
+__attribute__((weak)) void sdd1_mmio_write(Sdd1* s, uint16_t a, uint8_t v) { (void)s; (void)a; (void)v; }
+__attribute__((weak)) uint8_t sdd1_read(Sdd1* s, uint32_t a, const uint8_t* rom, uint32_t sz) {
+  (void)s; (void)a; (void)rom; (void)sz; return 0;
+}
+__attribute__((weak)) Sdd1* sdd1_alloc(void) { return NULL; }
+__attribute__((weak)) uint32_t sdd1_size(void) { return 0; }
 
 #ifdef GNW_SNES_CORE
 #include <assert.h>
@@ -131,6 +141,7 @@ Cart* cart_init(Snes* snes) {
   cart->ramSize = 0;
   cart->dsp1 = NULL;
   cart->cx4 = NULL;
+  cart->sdd1 = NULL;
   cart->romPageOk = 0;
   memset(cart->bankLowRom, 0, sizeof(cart->bankLowRom));
   for(int b = 0; b < 128; b++) cart->bankBase[b] = NULL;
@@ -166,6 +177,25 @@ void cart_attachCx4(Cart* cart) {
 #endif
 }
 
+void cart_attachSdd1(Cart* cart) {
+  if (cart->sdd1 == NULL) cart->sdd1 = sdd1_alloc();
+  if (cart->sdd1) {
+    sdd1_reset(cart->sdd1);
+    /* S-DD1 uses its own MMC for banks $C0-$FF, so disable the ROM page cache
+     * for those — cart_readHirom will route through sdd1_read instead. */
+    cart->romPageOk = 0;
+    cart_buildBankBases(cart);
+#ifdef GNW_SNES_CORE
+    printf("snes: S-DD1 attached (map=%s, %d KB ROM)\n",
+           cart->type == 1 ? "LoROM" : "HiROM",
+           (int)(cart->romSize / 1024));
+#endif
+  }
+#ifdef GNW_SNES_CORE
+  else printf("snes: S-DD1 alloc failed\n");
+#endif
+}
+
 void cart_free(Cart* cart) {
   snes_zfree(cart);
 }
@@ -174,6 +204,7 @@ void cart_reset(Cart* cart) {
   //if(cart->ramSize > 0 && cart->ram != NULL) memset(cart->ram, 0, cart->ramSize); // for now
   if (cart->dsp1) dsp1_reset(cart->dsp1);
   if (cart->cx4) cx4_init(cart->cx4);
+  if (cart->sdd1) sdd1_reset(cart->sdd1);
 }
 
 void cart_saveload(Cart *cart, SaveLoadFunc *func, void *ctx) {
@@ -183,6 +214,7 @@ void cart_saveload(Cart *cart, SaveLoadFunc *func, void *ctx) {
    * savestates stay byte-compatible. */
   if (cart->dsp1) func(ctx, cart->dsp1, dsp1_size());
   if (cart->cx4) func(ctx, cart->cx4, cx4_size());
+  if (cart->sdd1) func(ctx, cart->sdd1, sdd1_size());
 }
 
 void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
@@ -248,6 +280,12 @@ void cart_write(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
 void DumpCpuHistory();
 
 static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr) {
+  /* S-DD1 MMC/decompress window on upper banks. Keep full 24-bit address
+   * for DMA source address matching in sdd1_read(). */
+  if(cart->sdd1 && bank >= 0xc0) {
+    uint32_t full = ((uint32_t)bank << 16) | adr;
+    return sdd1_read(cart->sdd1, full, cart->rom, cart->romSize);
+  }
   if(((bank >= 0x70 && bank < 0x7e) || bank >= 0xf0) && adr < 0x8000 && cart->ramSize > 0) {
     // banks 70-7e and f0-ff, adr 0000-7fff
     return cart->ram[(((bank & 0xf) << 15) | adr) & (cart->ramSize - 1)];
@@ -298,6 +336,14 @@ static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val)
 }
 
 static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr) {
+  /* S-DD1 MMC: banks $C0-$FF (after mask: $40-$7F) go through the chip's
+   * memory-map controller and possibly the decompressor. */
+  if(cart->sdd1 && (bank & 0xc0) == 0xc0) {
+    /* $C0-$FF:$0000-$FFFF window: keep the full 24-bit CPU address for
+     * matching DMA source addresses exactly like S-DD1 hardware. */
+    uint32_t full = ((uint32_t)bank << 16) | adr;
+    return sdd1_read(cart->sdd1, full, cart->rom, cart->romSize);
+  }
   bank &= 0x7f;
   /* Cx4 owns $00-$3F/$80-$BF:$6000-$7FFF. Battery SRAM on those boards is
    * LoROM-style at $70-$77:$0000-$7FFF. */
