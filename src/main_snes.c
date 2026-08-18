@@ -191,7 +191,15 @@ static int SNES_ITCM_SCHED dots_to_next_event(Snes *s) {
 static void SNES_ITCM_SCHED apply_irq_match(Snes *s) {
   if (!(s->hIrqEnabled || s->vIrqEnabled)) return;
   if (s->vIrqEnabled && s->vPos != s->vTimer) return;
-  if (s->hIrqEnabled && s->hPos != s->hTimer * 4) return;
+  if (s->hIrqEnabled) {
+    if (s->hPos != s->hTimer * 4) return;
+  } else {
+    /* V-IRQ only is an edge at the start of vTimer (snes_handle_pos_stuff
+     * at hPos==0). Re-asserting every opcode holds TIMEUP after the handler
+     * reads $4211, so RTI immediately re-enters IRQ. TMZ's message box uses
+     * that pair (F80E then F89A on $4209) and collapsed to one scanline. */
+    return;
+  }
   s->inIrq = true;
   s->cpu->irqWanted = true;
 }
@@ -875,9 +883,13 @@ static void snes_wire_diag_flush(void) {
  * sram_save on app switch and sleep. Load the sidecar after ROM init and
  * before a resumed savestate so the slot's cart RAM wins.
  *
- * SPC7110: the 8 KB cart SRAM is battery-backed, and so is the RTC-4513
- * (16 bytes). Append RTC after SRAM so a cold launch keeps both; a file
- * that is only ramSize bytes (older sidecars) leaves the power-on RTC. */
+ * SPC7110: 8 KB SRAM, then 16 bytes of RTC-4513. Tengai Makyou Zero's
+ * self-test dumps the clock against the power-on image, then writes
+ * "SPC7110 CHECK OK" at SRAM $1FF0 only after the player sets date,
+ * time and birthday. Restore the RTC solely when that stamp is present
+ * (setup is done, check is skipped). Otherwise keep power-on so a
+ * mid-check quit still passes the dump. A file that is only ramSize
+ * bytes leaves the power-on RTC. */
 static void snes_SramSave(void)
 {
   Cart *cart;
@@ -940,9 +952,11 @@ static void snes_SramLoad(void)
       got = fread(cart->ram, 1, cart->ramSize, f);
       if (cart->spc7110 && got == cart->ramSize) {
         uint8_t rtc[16];
-        size_t nrtc = fread(rtc, 1, 16, f);
-        if (nrtc == 16) {
-          memcpy(cart->spc7110->rtc_ram, rtc, 16);
+        if (fread(rtc, 1, 16, f) == 16) {
+          static const char check_ok[16] = "SPC7110 CHECK OK";
+          if (cart->ramSize >= 16 &&
+              memcmp(cart->ram + (cart->ramSize - 16), check_ok, 16) == 0)
+            memcpy(cart->spc7110->rtc_ram, rtc, 16);
           got += 16;
         }
       }

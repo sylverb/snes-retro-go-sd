@@ -233,7 +233,12 @@ void snes_handle_pos_stuff(Snes *snes) {
   if (snes->hIrqEnabled || snes->vIrqEnabled) {
     bool match = true;
     if (snes->vIrqEnabled && snes->vPos != snes->vTimer) match = false;
-    if (snes->hIrqEnabled && snes->hPos != snes->hTimer * 4) match = false;
+    if (snes->hIrqEnabled) {
+      if (snes->hPos != snes->hTimer * 4) match = false;
+    } else if (snes->hPos != 0) {
+      /* V-IRQ only: once at the start of the line, not on every dot. */
+      match = false;
+    }
     if (match) {
       snes->inIrq = true;
       snes->cpu->irqWanted = true;
