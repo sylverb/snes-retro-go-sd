@@ -24,6 +24,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "odroid_system.h"
 #include "gw_lcd.h"
@@ -70,6 +71,7 @@ static void snes_wait_button(void)
 
 #include "snes/snes.h"
 #include "snes/cart.h"
+#include "snes/spc7110.h"
 #include "snes/ppu.h"
 #include "snes/apu.h"
 #include "snes/dsp.h"
@@ -576,20 +578,47 @@ static int16_t snes_pcm_ring[SNES_PCM_RING];
 static volatile uint16_t snes_pcm_head;
 static volatile uint16_t snes_pcm_tail;
 
+static void snes_do_console_reset(void) {
+  if (!snes) return;
+#ifdef HOST_BUILD
+  if (getenv("HOST_SPC7110_LOG") && snes->cart && snes->cart->ram &&
+      snes->cart->ramSize > 0) {
+    unsigned ff = 0, n11 = 0;
+    uint32_t n = snes->cart->ramSize;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+      if (snes->cart->ram[i] == 0xff) ff++;
+      if (snes->cart->ram[i] == 0x11) n11++;
+    }
+    fprintf(stderr, "spc7110: SRAM %uB before reset: ff=%u eleven=%u last16=",
+            (unsigned)n, ff, n11);
+    for (i = n - 16; i < n; i++)
+      fprintf(stderr, "%02x", snes->cart->ram[i]);
+    fprintf(stderr, "\n");
+  }
+#endif
+  wdog_refresh();
+  snes_reset(snes, true);
+  snes_stretch_reset();
+  snes_pcm_head = 0;
+  snes_pcm_tail = 0;
+  snes_half_ctr = 0;
+  wdog_refresh();
+}
+
+#ifdef HOST_BUILD
+void snes_console_reset(void) {
+  snes_do_console_reset();
+}
+#endif
+
 static bool snes_reset_cb(odroid_dialog_choice_t *option,
                          odroid_dialog_event_t event, uint32_t repeat)
 {
   (void)option;
   (void)repeat;
-  if (event == ODROID_DIALOG_ENTER && snes) {
-    wdog_refresh();
-    snes_reset(snes, true);
-    snes_stretch_reset();
-    snes_pcm_head = 0;
-    snes_pcm_tail = 0;
-    snes_half_ctr = 0;
-    wdog_refresh();
-  }
+  if (event == ODROID_DIALOG_ENTER)
+    snes_do_console_reset();
   return event == ODROID_DIALOG_ENTER;
 }
 
@@ -844,28 +873,45 @@ static void snes_wire_diag_flush(void) {
  * SMW / Zelda 3 / GBA ports. Savestates still snapshot cart RAM; the sidecar
  * is what in-game Save writes persist across a cold launch. Firmware calls
  * sram_save on app switch and sleep. Load the sidecar after ROM init and
- * before a resumed savestate so the slot's cart RAM wins. */
+ * before a resumed savestate so the slot's cart RAM wins.
+ *
+ * SPC7110: the 8 KB cart SRAM is battery-backed, and so is the RTC-4513
+ * (16 bytes). Append RTC after SRAM so a cold launch keeps both; a file
+ * that is only ramSize bytes (older sidecars) leaves the power-on RTC. */
 static void snes_SramSave(void)
 {
   Cart *cart;
+  size_t wrote = 0;
 
   if (!snes || !snes->cart)
     return;
   cart = snes->cart;
-  if (!cart->ram || cart->ramSize == 0)
+  if (!cart->ram || cart->ramSize == 0) {
+    printf("snes: SRAM save skipped (ram=%p size=%lu)\n",
+           (void *)cart->ram, (unsigned long)cart->ramSize);
     return;
-  if (!ACTIVE_FILE || !ACTIVE_FILE->path[0])
+  }
+  if (!ACTIVE_FILE || !ACTIVE_FILE->path[0]) {
+    printf("snes: SRAM save skipped (no ACTIVE_FILE)\n");
     return;
+  }
 
   wdog_refresh();
   char *path = odroid_system_get_path(ODROID_PATH_SAVE_SRAM, ACTIVE_FILE->path);
   if (path) {
     FILE *f = fopen(path, "wb");
     if (f) {
-      fwrite(cart->ram, 1, cart->ramSize, f);
+      wrote = fwrite(cart->ram, 1, cart->ramSize, f);
+      if (cart->spc7110)
+        wrote += fwrite(cart->spc7110->rtc_ram, 1, 16, f);
       fclose(f);
+      printf("snes: SRAM saved %s (%lu bytes)\n", path, (unsigned long)wrote);
+    } else {
+      printf("snes: SRAM save failed fopen %s\n", path);
     }
     free(path);
+  } else {
+    printf("snes: SRAM save skipped (no path)\n");
   }
   wdog_refresh();
 #ifdef SNES_SMW_HLE_PRODUCT
@@ -876,6 +922,7 @@ static void snes_SramSave(void)
 static void snes_SramLoad(void)
 {
   Cart *cart;
+  size_t got = 0;
 
   if (!snes || !snes->cart)
     return;
@@ -890,8 +937,19 @@ static void snes_SramLoad(void)
   if (path) {
     FILE *f = fopen(path, "rb");
     if (f) {
-      fread(cart->ram, 1, cart->ramSize, f);
+      got = fread(cart->ram, 1, cart->ramSize, f);
+      if (cart->spc7110 && got == cart->ramSize) {
+        uint8_t rtc[16];
+        size_t nrtc = fread(rtc, 1, 16, f);
+        if (nrtc == 16) {
+          memcpy(cart->spc7110->rtc_ram, rtc, 16);
+          got += 16;
+        }
+      }
       fclose(f);
+      printf("snes: SRAM loaded %s (%lu bytes)\n", path, (unsigned long)got);
+    } else {
+      printf("snes: SRAM none at %s\n", path);
     }
     free(path);
   }
@@ -925,6 +983,8 @@ static bool cart_needs_coprocessor(const uint8_t *rom, uint32_t len) {
           /* Cx4 is supported */
         } else if ((romType >> 4) == 0x04) {
           /* S-DD1 is supported (Star Ocean, SFA2) */
+        } else if ((romType >> 4) == 0x0F && (romType & 0x0f) == 0x09) {
+          /* SPC7110 is supported (Far East of Eden Zero / Momotaro / SPL4) */
         } else {
           return true;
         }

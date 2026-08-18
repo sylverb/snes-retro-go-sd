@@ -15,6 +15,11 @@ static int host_boot_trace_on(void) {
   if (t < 0) t = getenv("HOST_BOOT_TRACE") ? 1 : 0;
   return t;
 }
+static int host_hang_pc_on(void) {
+  static int t = -1;
+  if (t < 0) t = getenv("HOST_HANG_PC") ? 1 : 0;
+  return t;
+}
 #endif
 #ifndef GNW_SNES_CORE
 #include "../ida_types.h"
@@ -931,6 +936,33 @@ static void cpu_doOpcode(Cpu* cpu, uint8_t opcode) {
              cpu->k, (uint16_t)(cpu->pc - 1), opcode,
              cpu->a, cpu->x, cpu->y, cpu->sp, cpu->dp);
       boot_trace_left--;
+    }
+  }
+  if (host_hang_pc_on()) {
+    static unsigned n;
+    static uint32_t last_pc;
+    static unsigned stuck;
+    uint32_t pc = ((uint32_t)cpu->k << 16) | (uint16_t)(cpu->pc - 1);
+    n++;
+    if (pc == last_pc) stuck++;
+    else { stuck = 0; last_pc = pc; }
+    if (n <= 8 || n == 1000 || (n % 200000u) == 0u || stuck == 80000u) {
+      Snes *s = (Snes *)cpu->mem;
+      unsigned apu0 = 0, apu1 = 0;
+      if (s && s->apu) {
+        apu0 = s->apu->outPorts[0];
+        apu1 = s->apu->outPorts[1];
+      }
+      printf("hang: n=%u pc=%02x:%04x op=%02x a=%04x stuck=%u nmi=%d 2140=%02x 2141=%02x v=%u\n",
+             n, cpu->k, (uint16_t)(cpu->pc - 1), opcode, cpu->a, stuck,
+             s ? (int)s->cpu->nmiWanted : 0, apu0, apu1,
+             s ? s->vPos : 0);
+      fflush(stdout);
+    }
+    if (n >= 3000000u) {
+      printf("hang: abort after %u opcodes at %02x:%04x\n", n, cpu->k, (uint16_t)(cpu->pc - 1));
+      fflush(stdout);
+      exit(2);
     }
   }
 #endif

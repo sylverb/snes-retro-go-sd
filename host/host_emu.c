@@ -246,10 +246,17 @@ int host_poll_events(void)
     if (host_pad.want_save) {
         bool ok = odroid_system_emu_save_state(host_default_slot);
         printf("host: F1 save slot %d → %s\n", host_default_slot, ok ? "ok" : "failed");
+        if (host_sram_save_cb)
+            host_sram_save_cb();
     }
     if (host_pad.want_load) {
         bool ok = odroid_system_emu_load_state(host_default_slot);
         printf("host: F2 load slot %d → %s\n", host_default_slot, ok ? "ok" : "failed");
+    }
+    if (host_pad.want_reset) {
+        extern void snes_console_reset(void);
+        snes_console_reset();
+        printf("host: F5/R console reset (SRAM kept)\n");
     }
     return 1;
 }
@@ -267,10 +274,13 @@ static void host_flush_sram_once(void)
 
 static void host_maybe_quit(void)
 {
-    /* SRAM save (and anything else in the quit path) calls wdog_refresh(),
-     * which polls events and comes back here. Re-enter and the stack blows
-     * (zsh: segmentation fault on window close). */
+    /* SRAM save calls wdog_refresh(), which polls and comes back here.
+     * If we exit on that re-entry, fwrite never runs and there is no .sram.
+     * (The host_in_quit guard used to only skip a nested flush, then still
+     * exit(0) from this nested call.) */
     if (!quit_requested)
+        return;
+    if (host_in_quit)
         return;
     host_flush_sram_once();
     exit(0);
@@ -926,11 +936,13 @@ static void host_sanitize_stem(char *dst, size_t dst_sz, const char *name)
         name = "host";
     for (i = 0; name[i] && o + 1 < dst_sz; i++) {
         char c = name[i];
+        /* Stop at the last '.' (the extension), not the first — TMZ dumps
+         * are named like `[T.Eng-...].sfc`. */
+        if (c == '.' && strchr(name + i + 1, '.') == NULL)
+            break;
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
             (c >= '0' && c <= '9') || c == '-' || c == '_')
             dst[o++] = c;
-        else if (c == '.' )
-            break;
         else
             dst[o++] = '_';
     }

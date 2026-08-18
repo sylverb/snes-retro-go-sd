@@ -101,6 +101,9 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
   if(headers[used].coprocessor == 4 && headers[used].chips >= 3 && headers[used].chips <= 5) {
     cart_attachSdd1(snes->cart);
   }
+  if(headers[used].coprocessor == 15 && headers[used].chips == 9) {
+    cart_attachSpc7110(snes->cart);
+  }
   snes_reset(snes, true); // reset after loading
   snes_set_region(snes, headers[used].pal);
   return true;
@@ -139,6 +142,9 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
   }
   if(headers[used].coprocessor == 4 && headers[used].chips >= 3 && headers[used].chips <= 5) {
     cart_attachSdd1(snes->cart);
+  }
+  if(headers[used].coprocessor == 15 && headers[used].chips == 9) {
+    cart_attachSpc7110(snes->cart);
   }
   snes_reset(snes, true); // reset after loading
   snes_set_region(snes, headers[used].pal);

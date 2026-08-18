@@ -13,6 +13,7 @@
 #include "ppu.h"
 #include "cart.h"
 #include "sdd1.h"
+#include "spc7110.h"
 #include "input.h"
 #include "tracing.h"
 #include "snes_gnw_alloc.h"
@@ -212,6 +213,8 @@ void snes_handle_pos_stuff(Snes *snes) {
         // TODO: this starts a little after start of vblank
         snes->autoJoyTimer = 0;
       }
+      if (snes->cart && snes->cart->spc7110)
+        spc7110_tick(snes->cart->spc7110);
     }
   } else if (snes->hPos == 512) {
     // render the line halfway of the screen for better compatibility
@@ -297,6 +300,8 @@ void snes_run_line(Snes *snes) {
       snes->cpu->nmiWanted = true;
     if (snes->autoJoyRead)
       snes->autoJoyTimer = 0;
+    if (snes->cart && snes->cart->spc7110)
+      spc7110_tick(snes->cart->spc7110);
   }
 
   /* The V-timer matches on every dot of its line; setting the flag once is the
@@ -628,6 +633,9 @@ uint8_t snes_read(Snes* snes, uint32_t adr) {
     if(snes->cart->sdd1 && adr >= 0x4800 && adr < 0x4808) {
       return sdd1_mmio_read(snes->cart->sdd1, adr);
     }
+    if(snes->cart->spc7110 && adr >= 0x4800 && adr <= 0x4842) {
+      return spc7110_mmio_read(snes->cart->spc7110, adr, snes->cart->rom, snes->cart->romSize);
+    }
   }
 #if SNES_ROMPAGE_LOW == 2
   {
@@ -684,6 +692,9 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
     }
     if(snes->cart->sdd1 && adr >= 0x4800 && adr < 0x4808) {
       sdd1_mmio_write(snes->cart->sdd1, adr, val);
+    }
+    if(snes->cart->spc7110 && adr >= 0x4800 && adr <= 0x4842) {
+      spc7110_mmio_write(snes->cart->spc7110, adr, val, snes->cart->rom, snes->cart->romSize);
     }
   }
   // write to cart

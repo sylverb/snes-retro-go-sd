@@ -9,6 +9,7 @@
 #include "dsp1_hle.h"
 #include "cx4_hle.h"
 #include "sdd1.h"
+#include "spc7110.h"
 #include "snes_gnw_alloc.h"
 
 /* Weak fallbacks so build scripts that list snes/*.c files explicitly and
@@ -43,6 +44,19 @@ __attribute__((weak)) uint8_t sdd1_read(Sdd1* s, uint32_t a, const uint8_t* rom,
 }
 __attribute__((weak)) Sdd1* sdd1_alloc(void) { return NULL; }
 __attribute__((weak)) uint32_t sdd1_size(void) { return 0; }
+
+__attribute__((weak)) void spc7110_reset(Spc7110* s) { (void)s; }
+__attribute__((weak)) uint8_t spc7110_mmio_read(Spc7110* s, uint16_t a, const uint8_t* rom, uint32_t sz) {
+  (void)s; (void)a; (void)rom; (void)sz; return 0;
+}
+__attribute__((weak)) void spc7110_mmio_write(Spc7110* s, uint16_t a, uint8_t v, const uint8_t* rom, uint32_t sz) {
+  (void)s; (void)a; (void)v; (void)rom; (void)sz;
+}
+__attribute__((weak)) uint8_t spc7110_read(Spc7110* s, uint32_t a, const uint8_t* rom, uint32_t sz) {
+  (void)s; (void)a; (void)rom; (void)sz; return 0;
+}
+__attribute__((weak)) Spc7110* spc7110_alloc(void) { return NULL; }
+__attribute__((weak)) uint32_t spc7110_size(void) { return 0; }
 
 #ifdef GNW_SNES_CORE
 #include <assert.h>
@@ -142,6 +156,7 @@ Cart* cart_init(Snes* snes) {
   cart->dsp1 = NULL;
   cart->cx4 = NULL;
   cart->sdd1 = NULL;
+  cart->spc7110 = NULL;
   cart->romPageOk = 0;
   memset(cart->bankLowRom, 0, sizeof(cart->bankLowRom));
   for(int b = 0; b < 128; b++) cart->bankBase[b] = NULL;
@@ -196,6 +211,25 @@ void cart_attachSdd1(Cart* cart) {
 #endif
 }
 
+void cart_attachSpc7110(Cart* cart) {
+  if (cart->spc7110 == NULL) cart->spc7110 = spc7110_alloc();
+  if (cart->spc7110) {
+    spc7110_reset(cart->spc7110);
+    cart->romPageOk = 0;
+    cart_buildBankBases(cart);
+#ifdef GNW_SNES_CORE
+    printf("snes: SPC7110 attached (map=%s, %d KB ROM, %d KB SRAM%s)\n",
+           cart->type == 1 ? "LoROM" : "HiROM",
+           (int)(cart->romSize / 1024),
+           (int)(cart->ramSize / 1024),
+           cart->romSize > 0x600000 ? ", $40-$4F expansion" : "");
+#endif
+  }
+#ifdef GNW_SNES_CORE
+  else printf("snes: SPC7110 alloc failed\n");
+#endif
+}
+
 void cart_free(Cart* cart) {
   snes_zfree(cart);
 }
@@ -205,6 +239,7 @@ void cart_reset(Cart* cart) {
   if (cart->dsp1) dsp1_reset(cart->dsp1);
   if (cart->cx4) cx4_init(cart->cx4);
   if (cart->sdd1) sdd1_reset(cart->sdd1);
+  if (cart->spc7110) spc7110_reset(cart->spc7110);
 }
 
 void cart_saveload(Cart *cart, SaveLoadFunc *func, void *ctx) {
@@ -215,6 +250,7 @@ void cart_saveload(Cart *cart, SaveLoadFunc *func, void *ctx) {
   if (cart->dsp1) func(ctx, cart->dsp1, dsp1_size());
   if (cart->cx4) func(ctx, cart->cx4, cx4_size());
   if (cart->sdd1) func(ctx, cart->sdd1, sdd1_size());
+  if (cart->spc7110) func(ctx, cart->spc7110, spc7110_size());
 }
 
 void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
@@ -335,7 +371,25 @@ static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val)
   }
 }
 
+/* SPC7110 $4830 bit 7 enables cart SRAM. ares: disabled reads return 0,
+ * writes are ignored. The TMZ check program fills 8 KB with $FF only while
+ * that bit is set, then Mode 2 reads it back the same way. */
+static int cart_spc7110_sram_en(const Cart* cart) {
+  return !cart->spc7110 || (cart->spc7110->r4830 & 0x80);
+}
+
 static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr) {
+  if (cart->spc7110) {
+    if (bank == 0x50 || (bank >= 0x40 && bank <= 0x4f) ||
+        (bank >= 0xc0 && bank <= 0xff)) {
+      uint32_t full = ((uint32_t)bank << 16) | adr;
+      return spc7110_read(cart->spc7110, full, cart->rom, cart->romSize);
+    }
+    /* Program ROM is only $00-$0F / $80-$8F:$8000-$FFFF. $10-$3F would
+     * otherwise decode as HiROM into data ROM and execute garbage. */
+    if ((bank & 0x7f) >= 0x10 && (bank & 0x7f) < 0x40 && adr >= 0x8000)
+      return cart->snes->openBus;
+  }
   /* S-DD1 MMC: banks $C0-$FF (after mask: $40-$7F) go through the chip's
    * memory-map controller and possibly the decompressor. */
   if(cart->sdd1 && (bank & 0xc0) == 0xc0) {
@@ -360,6 +414,7 @@ static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr) {
   }
   if(bank < 0x40 && adr >= 0x6000 && adr < 0x8000 && cart->ramSize > 0) {
     // banks 00-3f and 80-bf, adr 6000-7fff
+    if (!cart_spc7110_sram_en(cart)) return 0x00;
     return cart->ram[(((bank & 0x3f) << 13) | (adr & 0x1fff)) & (cart->ramSize - 1)];
   }
   if(adr >= 0x8000 || bank >= 0x40) {
@@ -395,6 +450,7 @@ static void cart_writeHirom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val)
   }
   if(bank < 0x40 && adr >= 0x6000 && adr < 0x8000 && cart->ramSize > 0) {
     // banks 00-3f and 80-bf, adr 6000-7fff
+    if (!cart_spc7110_sram_en(cart)) return;
     cart->ram[(((bank & 0x3f) << 13) | (adr & 0x1fff)) & (cart->ramSize - 1)] = val;
   }
 }

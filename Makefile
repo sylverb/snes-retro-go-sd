@@ -40,6 +40,7 @@ $(SNES)/dsp.c \
 $(SNES)/dsp1_hle.c \
 $(SNES)/cx4_hle.c \
 $(SNES)/sdd1.c \
+$(SNES)/spc7110.c \
 $(SNES)/input.c \
 $(SNES)/ppu.c \
 $(SNES)/snes.c \

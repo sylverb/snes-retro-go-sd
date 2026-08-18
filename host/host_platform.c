@@ -144,6 +144,7 @@ int host_platform_poll(host_pad_t *pad)
     if (pad) {
         pad->want_save = 0;
         pad->want_load = 0;
+        pad->want_reset = 0;
     }
 
     while (SDL_PollEvent(&ev)) {
@@ -160,6 +161,8 @@ int host_platform_poll(host_pad_t *pad)
                     pad->want_save = 1;
                 else if (sc == SDL_SCANCODE_F2)
                     pad->want_load = 1;
+                else if (sc == SDL_SCANCODE_F5 || sc == SDL_SCANCODE_R)
+                    pad->want_reset = 1;
             }
             int mapped = map_scancode(sc);
             if (mapped >= 0 && pad)
@@ -178,6 +181,8 @@ int host_platform_poll(host_pad_t *pad)
                     pad->want_save = 1;
                 else if (sc == SDL_SCANCODE_F2)
                     pad->want_load = 1;
+                else if (sc == SDL_SCANCODE_F5 || sc == SDL_SCANCODE_R)
+                    pad->want_reset = 1;
             }
             int mapped = map_scancode(sc);
             if (mapped >= 0 && pad)
