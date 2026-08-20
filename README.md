@@ -55,3 +55,24 @@ Host uses the C interpreters (no Thumb-2 ASM). Scale with `HOST_SCALE=2`
 | `sdk/` | Vendored ABI bridge / headers / packer |
 
 See `CLAUDE.md` for the general core memory map and porting checklist.
+
+## Releases (GitHub tags `v*`)
+
+Pushing a tag `vX.Y.Z` (with a matching `## [vX.Y.Z]` section in
+`CHANGELOG.md`) creates a GitHub Release with **two** zip assets only:
+
+| Asset | Contents |
+|-------|----------|
+| `snes-vX.Y.Z.zip` | SD layout: `cores/snes.bin` |
+| `snes-vX.Y.Z-debug.zip` | `snes_core.elf`, linker `.map`, and a short README |
+
+Unzip the install archive onto the SD card root. For a crash PC/LR:
+
+```bash
+unzip snes-v1.0.0-debug.zip
+arm-none-eabi-addr2line -e snes_core.elf -f -C -a 0x<PC> 0x<LR>
+```
+
+Needs `arm-none-eabi-addr2line` on `PATH`, or the `sylverb/retro-go-sd-builder`
+Docker image. From a repo checkout you can also use
+`python3 scripts/resolve_addr.py --elf …` — see the README inside the debug zip.
