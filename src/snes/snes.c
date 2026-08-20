@@ -212,6 +212,9 @@ void snes_handle_pos_stuff(Snes *snes) {
       if (snes->autoJoyRead) {
         // TODO: this starts a little after start of vblank
         snes->autoJoyTimer = 0;
+        /* After 16 hardware clocks the leftover serial bits are 1. */
+        snes->input1->latchedState = 0xffff;
+        snes->input2->latchedState = 0xffff;
       }
       if (snes->cart && snes->cart->spc7110)
         spc7110_tick(snes->cart->spc7110);
@@ -303,8 +306,11 @@ void snes_run_line(Snes *snes) {
     snes->inNmi = true;
     if (snes->nmiEnabled)
       snes->cpu->nmiWanted = true;
-    if (snes->autoJoyRead)
+    if (snes->autoJoyRead) {
       snes->autoJoyTimer = 0;
+      snes->input1->latchedState = 0xffff;
+      snes->input2->latchedState = 0xffff;
+    }
     if (snes->cart && snes->cart->spc7110)
       spc7110_tick(snes->cart->spc7110);
   }
