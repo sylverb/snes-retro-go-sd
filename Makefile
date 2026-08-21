@@ -139,19 +139,29 @@ $(BUILD_DIR)/main_snes.o: CFLAGS += \
 PACKED_BIN := snes.bin
 PACK_CORE  := $(GNW_CORE_SDK)/tools/pack_core.py
 PAD_LOGO_C    := src/assets/snes_logos.c:pad_snes
-HEADER_LOGO_C := src/assets/snes_logos.c:header_snes
+HEADER_LOGO   := src/assets/header.bmp
+
+#######################################
+# Packed header version
+#######################################
+# gnw_core_meta_t only stores major.minor.patch (0..255).
+# CORE_VERSION is the full git describe string passed to the packer; it
+# extracts the leading vX.Y.Z (NOTAG / missing tags → 0.0.0).
+# Override: make CORE_VERSION=v1.2.3
+CORE_VERSION ?= $(shell git describe --tags --dirty 2>/dev/null || echo NOTAG)
 
 .PHONY: pack
 pack: $(TARGET_BIN)
-	$(V)$(ECHO) [ PACK CORE ] $(PACKED_BIN)
+	$(V)$(ECHO) [ PACK CORE ] $(PACKED_BIN) version=$(CORE_VERSION)
 	$(V)python3 $(PACK_CORE) \
 		--elf $(TARGET_ELF) --bin $(TARGET_BIN) \
 		--system-name "SNES" --dirname snes \
 		--extensions "sfc smc fig swc" \
 		--core-name "lakesnes" \
-		--version 1.0.0 \
+		--version "$(CORE_VERSION)" \
 		--pad-logo-c $(PAD_LOGO_C) \
-		--header-logo-c $(HEADER_LOGO_C) \
+		--header-logo $(HEADER_LOGO) \
+		--logo-invert \
 		--out $(PACKED_BIN)
 
 all: pack
@@ -163,7 +173,7 @@ clean::
 # Docker
 #######################################
 .PHONY: docker docker_pull docker_shell print-PROJECT_KIND print-PACKED_BIN print-CORE_NAME print-DOCKER_IMAGE \
-	print-TARGET_ELF print-TARGET_MAP
+	print-TARGET_ELF print-TARGET_MAP print-CORE_VERSION
 
 print-PROJECT_KIND:
 	@echo $(PROJECT_KIND)
@@ -177,6 +187,8 @@ print-TARGET_ELF:
 	@echo $(TARGET_ELF)
 print-TARGET_MAP:
 	@echo $(BUILD_DIR)/$(CORE_NAME)_core.map
+print-CORE_VERSION:
+	@echo $(CORE_VERSION)
 
 RELEASE_VERSION ?= v1.5
 DOCKER_REPOSITORY ?= sylverb/retro-go-sd-builder

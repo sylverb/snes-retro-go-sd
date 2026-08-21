@@ -28,6 +28,11 @@ make host     # Linux/macOS SDL preview (same src/main_snes.c)
 Produces `snes.bin` → copy to `/cores/snes.bin`. ROMs under
 `/roms/snes/` (`.sfc` `.smc` `.fig` `.swc`).
 
+The packed header version is taken from `git describe --tags --dirty`
+(`CORE_VERSION`; override with `make CORE_VERSION=v1.2.3`). No tags →
+`NOTAG` → header `0.0.0`. Release tags should be `vX.Y.Z` so the Info
+dialog can show a semantic version.
+
 Requirements: `arm-none-eabi-gcc`, Make, Python 3 + Pillow; or Docker image
 `sylverb/retro-go-sd-builder:v1.5`.
 
