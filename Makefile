@@ -138,8 +138,8 @@ $(BUILD_DIR)/main_snes.o: CFLAGS += \
 
 PACKED_BIN := snes.bin
 PACK_CORE  := $(GNW_CORE_SDK)/tools/pack_core.py
-PAD_LOGO_C    := src/assets/snes_logos.c:pad_snes
-HEADER_LOGO   := src/assets/header.bmp
+PAD_LOGO    := src/assets/pad.bmp
+HEADER_LOGO := src/assets/header.bmp
 
 #######################################
 # Packed header version
@@ -159,7 +159,7 @@ pack: $(TARGET_BIN)
 		--extensions "sfc smc fig swc" \
 		--core-name "lakesnes" \
 		--version "$(CORE_VERSION)" \
-		--pad-logo-c $(PAD_LOGO_C) \
+		--pad-logo $(PAD_LOGO) \
 		--header-logo $(HEADER_LOGO) \
 		--logo-invert \
 		--out $(PACKED_BIN)
