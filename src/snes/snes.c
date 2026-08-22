@@ -454,11 +454,8 @@ static uint8_t snes_readReg(Snes* snes, uint16_t adr) {
 #endif
       uint8_t val = 0x2; // CPU version (4 bit)
       val |= snes->inNmi << 7;
-      /* Compatibility: keep RDNMI high while vblank is active.
-       * A few titles poll 4210 multiple times in the same vblank window; if the
-       * first read clears it immediately they can miss the event and deadloop. */
-      if (!snes->inVblank)
-        snes->inNmi = false;
+      /* RDNMI bit 7 clears on read (and at end of vblank). */
+      snes->inNmi = false;
       return val | (snes->openBus & 0x70);
     }
     case 0x4211: {
