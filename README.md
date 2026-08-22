@@ -49,6 +49,18 @@ make host
 Host uses the C interpreters (no Thumb-2 ASM). Scale with `HOST_SCALE=2`
 (default); SDL3 via `make host HOST_SDL=3`.
 
+## Controls (pause menu → Controls)
+
+Firmware maps **GAME→START**, **TIME→SELECT**, and on Zelda HW the extra
+Start/Select buttons → **X/Y**. Profiles:
+
+| Profile | Hardware default (Auto) | L/R | Notes |
+|---------|-------------------------|-----|--------|
+| **Auto** | Zelda → L/R, Mario → Mario | — | Picks below via `get_ofw_is_mario()` |
+| **L/R** | Zelda | GAME+B / GAME+A | TIME=X, phys Select=Y, phys Start=Start, GAME+TIME=Select |
+| **Face** | — | none | GAME=Start, TIME=Select, phys Start/Select = X/Y |
+| **Mario** | Mario | none | A=B, B=X+Y, GAME+A=A, TIME=Select, GAME+TIME=Start |
+
 ## Layout
 
 | Path | Notes |

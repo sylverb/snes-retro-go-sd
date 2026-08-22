@@ -43,6 +43,9 @@
 #include "gw_core_i18n.h"
 #endif
 
+/* Firmware ABI (objcopy → core_get_ofw_is_mario). Host stub in host_emu.c. */
+bool get_ofw_is_mario(void);
+
 void draw_error_screen(const char *main_line, const char *line_1, const char *line_2);
 
 /* Block until any pad edge after an error screen (draw_error_screen itself
@@ -313,22 +316,99 @@ static void SNES_ITCM_SCHED run_frame_events(Snes *s) {
 }
 
 /* ---- input ----------------------------------------------------------------
- * LakeSnes input1->currentState bit layout (auto-joypad order):
- * 0=B 1=Y 2=Select 3=Start 4=Up 5=Down 6=Left 7=Right 8=A 9=X 10=L 11=R.
- * Two face buttons on the unit: A→A, B→B; GAME→X, TIME→Y so ALttP's map/item
- * screens stay reachable; START/SELECT as themselves (Zelda-edition buttons). */
+ * LakeSnes currentState bits: 0=B 1=Y 2=Select 3=Start 4=Up 5=Down 6=Left
+ * 7=Right 8=A 9=X 10=L 11=R.
+ *
+ * Firmware odroid_input maps hardware as:
+ *   START=GAME, SELECT=TIME, X=phys Start (Zelda), Y=phys Select (Zelda),
+ *   VOLUME=PAUSE/SET. PAUSE combos stay with the launcher — ignore VOLUME.
+ *
+ * Profiles (pause menu "Controls"; Auto picks Shoulders on Zelda HW and
+ * Mario on Mario HW via get_ofw_is_mario):
+ *   Shoulders — zelda3-like: GAME+A/B = R/L, TIME=X, phys Select=Y,
+ *               phys Start=Start, GAME+TIME=Select
+ *   Face      — direct: GAME=Start, TIME=Select, phys Start/Select = X/Y
+ *               (no L/R; good when X/Y must be one press)
+ *   Mario     — smw Mario-like: A=B, B=X+Y, GAME+A=A, TIME=Select,
+ *               GAME+TIME=Start (no L/R — GAME+A is already SNES A) */
+
+typedef enum {
+  SNES_PAD_AUTO = 0,
+  SNES_PAD_SHOULDERS = 1,
+  SNES_PAD_FACE = 2,
+  SNES_PAD_MARIO = 3,
+  SNES_PAD_PROFILE_COUNT
+} snes_pad_profile_t;
+
+static int snes_pad_profile = SNES_PAD_AUTO;
+static char snes_pad_map_value[12];
+
+static snes_pad_profile_t snes_pad_profile_effective(void)
+{
+  if (snes_pad_profile == SNES_PAD_AUTO)
+    return get_ofw_is_mario() ? SNES_PAD_MARIO : SNES_PAD_SHOULDERS;
+  return (snes_pad_profile_t)snes_pad_profile;
+}
+
 static uint16_t read_snes_pad(odroid_gamepad_state_t *joy) {
   uint16_t s = 0;
-  if (joy->values[ODROID_INPUT_B])      s |= 1u << 0;
-  if (joy->values[ODROID_INPUT_Y])      s |= 1u << 1;   /* TIME  = SNES Y      */
-  if (joy->values[ODROID_INPUT_SELECT]) s |= 1u << 2;
-  if (joy->values[ODROID_INPUT_START])  s |= 1u << 3;
-  if (joy->values[ODROID_INPUT_UP])     s |= 1u << 4;
-  if (joy->values[ODROID_INPUT_DOWN])   s |= 1u << 5;
-  if (joy->values[ODROID_INPUT_LEFT])   s |= 1u << 6;
-  if (joy->values[ODROID_INPUT_RIGHT])  s |= 1u << 7;
-  if (joy->values[ODROID_INPUT_A])      s |= 1u << 8;
-  if (joy->values[ODROID_INPUT_X])      s |= 1u << 9;   /* GAME  = SNES X      */
+  /* D-pad always. */
+  if (joy->values[ODROID_INPUT_UP])    s |= 1u << 4;
+  if (joy->values[ODROID_INPUT_DOWN])  s |= 1u << 5;
+  if (joy->values[ODROID_INPUT_LEFT])  s |= 1u << 6;
+  if (joy->values[ODROID_INPUT_RIGHT]) s |= 1u << 7;
+
+  /* PAUSE/SET held: launcher owns the chord; emit no face/shoulder. */
+  if (joy->values[ODROID_INPUT_VOLUME])
+    return s;
+
+  const bool game = joy->values[ODROID_INPUT_START] != 0;   /* GAME */
+  const bool time = joy->values[ODROID_INPUT_SELECT] != 0;  /* TIME */
+  const bool a = joy->values[ODROID_INPUT_A] != 0;
+  const bool b = joy->values[ODROID_INPUT_B] != 0;
+  const bool phys_start = joy->values[ODROID_INPUT_X] != 0;  /* Zelda Start */
+  const bool phys_select = joy->values[ODROID_INPUT_Y] != 0; /* Zelda Select */
+
+  switch (snes_pad_profile_effective()) {
+  case SNES_PAD_SHOULDERS:
+    /* GAME is a modifier only — never SNES Start by itself. */
+    if (game) {
+      if (a) s |= 1u << 11;       /* GAME+A = R */
+      if (b) s |= 1u << 10;       /* GAME+B = L */
+      if (time) s |= 1u << 2;     /* GAME+TIME = Select */
+    } else {
+      if (a) s |= 1u << 8;        /* A */
+      if (b) s |= 1u << 0;        /* B */
+      if (time) s |= 1u << 9;     /* TIME = X */
+      if (phys_select) s |= 1u << 1; /* phys Select = Y */
+      if (phys_start) s |= 1u << 3;  /* phys Start = Start */
+    }
+    break;
+
+  case SNES_PAD_MARIO:
+    if (game) {
+      if (a) s |= 1u << 8;        /* GAME+A = A */
+      if (time) s |= 1u << 3;     /* GAME+TIME = Start */
+    } else {
+      if (a) s |= 1u << 0;        /* A = B */
+      if (b) {                    /* B = X and Y (dash / item) */
+        s |= 1u << 9;
+        s |= 1u << 1;
+      }
+      if (time) s |= 1u << 2;     /* TIME = Select */
+    }
+    break;
+
+  case SNES_PAD_FACE:
+  default:
+    if (b) s |= 1u << 0;
+    if (phys_select) s |= 1u << 1; /* Y */
+    if (time) s |= 1u << 2;        /* Select */
+    if (game) s |= 1u << 3;        /* Start */
+    if (a) s |= 1u << 8;
+    if (phys_start) s |= 1u << 9;  /* X */
+    break;
+  }
   return s;
 }
 
@@ -517,6 +597,14 @@ static const gw_i18n_entry_t i18n_pad_port[] = {
   GW_I18N_END
 };
 
+static const gw_i18n_entry_t i18n_pad_map[] = {
+  { "en", "Controls" },
+  { "fr", "Commandes" },
+  { "es", "Controles" },
+  { "de", "Steuerung" },
+  GW_I18N_END
+};
+
 static const gw_i18n_entry_t i18n_reset[] = {
   { "en", "Reset" },
   { "fr", "Réinitialiser" },
@@ -567,6 +655,31 @@ static bool snes_pad_port_cb(odroid_dialog_choice_t *option,
     odroid_settings_app_int32_set("PadPort", snes_pad_port);
   }
   strcpy(option->value, snes_pad_port ? "2" : "1");
+  return event == ODROID_DIALOG_ENTER;
+}
+
+static void snes_pad_map_label(char *dst, size_t dst_sz)
+{
+  static const char *const names[] = { "Auto", "L/R", "Face", "Mario" };
+  int p = snes_pad_profile;
+  if (p < 0 || p >= SNES_PAD_PROFILE_COUNT)
+    p = SNES_PAD_AUTO;
+  snprintf(dst, dst_sz, "%s", names[p]);
+}
+
+static bool snes_pad_map_cb(odroid_dialog_choice_t *option,
+                           odroid_dialog_event_t event, uint32_t repeat)
+{
+  (void)repeat;
+  if (event == ODROID_DIALOG_PREV || event == ODROID_DIALOG_NEXT) {
+    if (event == ODROID_DIALOG_NEXT)
+      snes_pad_profile = (snes_pad_profile + 1) % SNES_PAD_PROFILE_COUNT;
+    else
+      snes_pad_profile = (snes_pad_profile + SNES_PAD_PROFILE_COUNT - 1) %
+                         SNES_PAD_PROFILE_COUNT;
+    odroid_settings_app_int32_set("PadMap", snes_pad_profile);
+  }
+  snes_pad_map_label(option->value, sizeof(snes_pad_map_value));
   return event == ODROID_DIALOG_ENTER;
 }
 
@@ -1154,6 +1267,7 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
   odroid_dialog_choice_t options[] = {
       {100, gw_i18n(i18n_half_render), snes_half_value, 1, &snes_half_render_cb},
       {101, gw_i18n(i18n_pad_port), snes_pad_value, 1, &snes_pad_port_cb},
+      {103, gw_i18n(i18n_pad_map), snes_pad_map_value, 1, &snes_pad_map_cb},
       {102, gw_i18n(i18n_reset), NULL, 1, &snes_reset_cb},
       ODROID_DIALOG_CHOICE_LAST
   };
@@ -1170,6 +1284,12 @@ void app_main_snes(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
   odroid_system_init(APPID_SNES, SNES_AUDIO_RATE);
   snes_half_render = odroid_settings_app_int32_get("HalfRender", 1) != 0;
   snes_pad_port = odroid_settings_app_int32_get("PadPort", 0) != 0 ? 1 : 0;
+  {
+    int pm = odroid_settings_app_int32_get("PadMap", SNES_PAD_AUTO);
+    if (pm < 0 || pm >= SNES_PAD_PROFILE_COUNT)
+      pm = SNES_PAD_AUTO;
+    snes_pad_profile = pm;
+  }
   snes_apply_frame_time();
 #ifdef SNES_SMW_HLE_PRODUCT
   odroid_system_emu_init(&snes_LoadState, &snes_SaveState, &snes_Screenshot,

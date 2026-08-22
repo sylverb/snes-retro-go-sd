@@ -341,6 +341,12 @@ uint32_t lcd_get_last_refresh_rate(void)
     return lcd_refresh_hz;
 }
 
+bool get_ofw_is_mario(void)
+{
+    /* Desktop preview defaults to Zelda-layout (Start/Select keys exist). */
+    return false;
+}
+
 void lcd_set_buffers(uint16_t *buf1, uint16_t *buf2)
 {
     if (buf1)
